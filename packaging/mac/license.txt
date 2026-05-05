@@ -1,0 +1,17 @@
+LOTUS Agent Child — License
+============================
+
+Copyright (c) 2026 Lotus Algebra.
+
+This software is provided to the licensee for internal use only. You may
+install, run, and modify it on machines you own or control. You may not
+redistribute it outside your organisation without written permission.
+
+The software is provided "as is", without warranty of any kind, express
+or implied, including but not limited to the warranties of
+merchantability, fitness for a particular purpose, and noninfringement.
+In no event shall the authors or copyright holders be liable for any
+claim, damages, or other liability arising from the use of this
+software.
+
+By clicking "Agree" you agree to these terms.

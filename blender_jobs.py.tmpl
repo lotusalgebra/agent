@@ -1,0 +1,229 @@
+# LOTUS Blender job runner.
+# Driven by blender.py via:
+#   /Applications/Blender.app/Contents/MacOS/Blender --background --python <this script>
+#
+# Tokens (<<NAME>>) are replaced at runtime before subprocess launch.
+#
+# Mode A (image_to_reel): single still PNG → animated MP4 with camera motion
+#   (Ken Burns / zoom-in / zoom-out / pan-left / pan-right).
+# Mode B (render_template): open <<TEMPLATE_BLEND>>, replace named text/image
+#   placeholders with REPLACEMENTS dict, render the existing animation.
+
+import bpy
+import os
+import sys
+import json
+
+# ── Tokens replaced by Python wrapper ────────────────────────────────────
+MODE         = "<<MODE>>"            # "image" | "template"
+IMAGE        = r"""<<IMAGE>>"""
+OUTPUT       = r"""<<OUTPUT_PATH>>"""
+DURATION     = float("<<DURATION>>")
+FPS          = int("<<FPS>>")
+RES_X        = int("<<RES_X>>")
+RES_Y        = int("<<RES_Y>>")
+MOTION       = "<<MOTION>>"          # ken_burns / zoom_in / zoom_out / pan_left / pan_right
+TEMPLATE_BLEND = r"""<<TEMPLATE_BLEND>>"""
+REPLACEMENTS = json.loads("""<<REPLACEMENTS_JSON>>""")
+
+
+def setup_render(scene, res_x, res_y, fps, total_frames, output_path):
+    scene.render.resolution_x = res_x
+    scene.render.resolution_y = res_y
+    scene.render.resolution_percentage = 100
+    scene.render.fps = fps
+    scene.frame_start = 1
+    scene.frame_end   = max(1, total_frames)
+    scene.render.image_settings.file_format = 'FFMPEG'
+    scene.render.ffmpeg.format = 'MPEG4'
+    scene.render.ffmpeg.codec  = 'H264'
+    scene.render.ffmpeg.constant_rate_factor = 'HIGH'  # quality preset
+    scene.render.ffmpeg.audio_codec = 'NONE'           # silent reels (audio
+                                                        # comes from Premiere)
+    scene.render.filepath = output_path
+    # Eevee for speed (Cycles is overkill for 2D image animation).
+    try:
+        scene.render.engine = 'BLENDER_EEVEE_NEXT'
+    except Exception:
+        try: scene.render.engine = 'BLENDER_EEVEE'
+        except Exception: pass
+
+
+def setup_unlit_image_plane(image_path):
+    """Add a plane sized to the image's aspect ratio + an unlit emission
+    material so the rendered image is pixel-faithful (no scene lighting)."""
+    bpy.ops.mesh.primitive_plane_add(size=2.0, location=(0, 0, 0))
+    plane = bpy.context.active_object
+    plane.name = "LotusImagePlane"
+
+    img = bpy.data.images.load(image_path, check_existing=False)
+    iw, ih = img.size
+    # Scale the plane so its longest side is 1.0; the camera will frame this.
+    if iw >= ih:
+        plane.scale = (1.0, ih / iw, 1.0)
+    else:
+        plane.scale = (iw / ih, 1.0, 1.0)
+
+    mat = bpy.data.materials.new(name="LotusImageMat")
+    mat.use_nodes = True
+    nt = mat.node_tree
+    # Strip default Principled BSDF; replace with Emission so render is
+    # 100% the source pixels — no shading, no shadows.
+    for n in list(nt.nodes):
+        if n.type != 'OUTPUT_MATERIAL':
+            nt.nodes.remove(n)
+    out = next(n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL')
+    tex = nt.nodes.new('ShaderNodeTexImage')
+    tex.image = img
+    tex.location = (-300, 0)
+    emit = nt.nodes.new('ShaderNodeEmission')
+    emit.location = (-50, 0)
+    nt.links.new(tex.outputs['Color'], emit.inputs['Color'])
+    nt.links.new(emit.outputs['Emission'], out.inputs['Surface'])
+    plane.data.materials.append(mat)
+    return plane, iw, ih
+
+
+def setup_camera(scene, res_x, res_y, plane_w, plane_h):
+    """Orthographic camera centred on the plane. Blender's `ortho_scale`
+    measures Blender units along the LONGER axis of the output frame.
+
+    To make the image fully cover the output (cropping where needed,
+    no black bars), we want the largest `ortho_scale` such that the
+    camera frame still fits inside the plane bounds in BOTH axes:
+
+        ortho_scale <= plane_h                    (height fits)
+        ortho_scale * out_aspect <= plane_w       (width fits)
+                                                  where out_aspect = W/H
+
+    => ortho_scale = min(plane_h, plane_w / out_aspect)
+    """
+    bpy.ops.object.camera_add(location=(0, 0, 5.0))
+    cam = bpy.context.active_object
+    cam.name = "LotusCam"
+    cam.rotation_euler = (0, 0, 0)
+    cam.data.type = 'ORTHO'
+    out_aspect = res_x / res_y if res_y else 1.0
+    cam.data.ortho_scale = min(plane_h, plane_w / out_aspect)
+    scene.camera = cam
+    return cam
+
+
+def keyframe_motion(cam, scene, motion):
+    """Add 2 keyframes to drive the chosen camera motion across the
+    timeline. Deltas are relative to ortho_scale so the motion feels
+    consistent regardless of image aspect / output format.
+
+    Numbers tuned for clearly visible Ken Burns: ~20% zoom range plus
+    a 12% lateral pan over the timeline."""
+    f0 = scene.frame_start
+    f1 = scene.frame_end
+    base_scale = cam.data.ortho_scale
+    base_z = cam.location.z
+    # Pan offset = 12% of the camera's longer axis. Multiply by base_scale
+    # so the same percentage applies whether the camera covers a tiny
+    # detail or a wide vista.
+    pan = base_scale * 0.12
+
+    if motion == 'ken_burns':
+        # Wider start, slight diagonal pan, end zoomed in. ~20% zoom range.
+        cam.data.ortho_scale = base_scale * 1.10
+        cam.location  = (-pan, -pan * 0.6, base_z)
+        cam.keyframe_insert(data_path="location", frame=f0)
+        cam.data.keyframe_insert(data_path="ortho_scale", frame=f0)
+        cam.data.ortho_scale = base_scale * 0.88
+        cam.location  = (pan, pan * 0.6, base_z)
+        cam.keyframe_insert(data_path="location", frame=f1)
+        cam.data.keyframe_insert(data_path="ortho_scale", frame=f1)
+    elif motion == 'zoom_in':
+        cam.data.ortho_scale = base_scale * 1.15
+        cam.data.keyframe_insert(data_path="ortho_scale", frame=f0)
+        cam.data.ortho_scale = base_scale * 0.85
+        cam.data.keyframe_insert(data_path="ortho_scale", frame=f1)
+    elif motion == 'zoom_out':
+        cam.data.ortho_scale = base_scale * 0.85
+        cam.data.keyframe_insert(data_path="ortho_scale", frame=f0)
+        cam.data.ortho_scale = base_scale * 1.15
+        cam.data.keyframe_insert(data_path="ortho_scale", frame=f1)
+    elif motion == 'pan_right':
+        cam.location = (-pan * 1.5, 0, base_z)
+        cam.keyframe_insert(data_path="location", frame=f0)
+        cam.location = (pan * 1.5, 0, base_z)
+        cam.keyframe_insert(data_path="location", frame=f1)
+    elif motion == 'pan_left':
+        cam.location = (pan * 1.5, 0, base_z)
+        cam.keyframe_insert(data_path="location", frame=f0)
+        cam.location = (-pan * 1.5, 0, base_z)
+        cam.keyframe_insert(data_path="location", frame=f1)
+    # else: static — no keyframes
+
+
+def apply_replacements(repl):
+    """For template mode: walk every text and image placeholder in the
+    open .blend and substitute. Keys in `repl` match Blender object names
+    or text-data names. Conventions:
+      - object named `lotus_text_<slot>` → set its TextCurve body
+      - image-texture named `lotus_image_<slot>` → load the replacement PNG
+    Anything not matched is left alone."""
+    for obj in bpy.data.objects:
+        if obj.type == 'FONT' and obj.name.startswith("lotus_text_"):
+            slot = obj.name[len("lotus_text_"):]
+            if slot in repl:
+                obj.data.body = str(repl[slot])
+    for img in bpy.data.images:
+        if img.name.startswith("lotus_image_"):
+            slot = img.name[len("lotus_image_"):]
+            if slot in repl:
+                try:
+                    new = bpy.data.images.load(str(repl[slot]),
+                                               check_existing=False)
+                    # Swap the image — every material referencing the named
+                    # image gets the new pixels.
+                    img.user_remap(new)
+                    new.name = img.name  # preserve the lookup name
+                except Exception as e:
+                    print(f"[blender] image swap {slot} failed: {e}")
+
+
+# ── Run ──────────────────────────────────────────────────────────────────
+
+if MODE == "image":
+    # IMPORTANT — do NOT call `read_factory_settings()` first. In
+    # Blender 5.x the factory-settings reset disables the FFmpeg addon
+    # which removes FFMPEG from the file_format enum, breaking MP4
+    # output. The startup file has FFmpeg registered by default, so
+    # just clear its default objects (cube/light/camera) and proceed.
+    for obj in list(bpy.context.scene.objects):
+        bpy.data.objects.remove(obj, do_unlink=True)
+    scene = bpy.context.scene
+    total = max(1, int(round(DURATION * FPS)))
+    setup_render(scene, RES_X, RES_Y, FPS, total, OUTPUT)
+    plane, iw, ih = setup_unlit_image_plane(IMAGE)
+    cam = setup_camera(scene, RES_X, RES_Y,
+                        plane.scale.x, plane.scale.y)
+    keyframe_motion(cam, scene, MOTION)
+    print(f"[blender] image mode  res={RES_X}x{RES_Y}  fps={FPS}  "
+          f"frames={total}  motion={MOTION}", flush=True)
+    bpy.ops.render.render(animation=True)
+    print(f"[blender] DONE: {OUTPUT}", flush=True)
+elif MODE == "template":
+    if not TEMPLATE_BLEND or not os.path.isfile(TEMPLATE_BLEND):
+        print(f"[blender] template not found: {TEMPLATE_BLEND}", flush=True)
+        sys.exit(1)
+    bpy.ops.wm.open_mainfile(filepath=TEMPLATE_BLEND)
+    scene = bpy.context.scene
+    if RES_X > 0: scene.render.resolution_x = RES_X
+    if RES_Y > 0: scene.render.resolution_y = RES_Y
+    if FPS  > 0: scene.render.fps = FPS
+    scene.render.image_settings.file_format = 'FFMPEG'
+    scene.render.ffmpeg.format = 'MPEG4'
+    scene.render.ffmpeg.codec  = 'H264'
+    scene.render.filepath = OUTPUT
+    apply_replacements(REPLACEMENTS or {})
+    print(f"[blender] template mode  template={TEMPLATE_BLEND}  "
+          f"replacements={list((REPLACEMENTS or {}).keys())}", flush=True)
+    bpy.ops.render.render(animation=True)
+    print(f"[blender] DONE: {OUTPUT}", flush=True)
+else:
+    print(f"[blender] unknown MODE {MODE!r}", flush=True)
+    sys.exit(1)

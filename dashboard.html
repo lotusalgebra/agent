@@ -1,0 +1,2328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LOTUS Agent — Control Center</title>
+<!-- Drawflow: vanilla-JS node/flow library that renders proper pipeline DAGs
+     with smooth Bézier connectors, zoom/pan, and drag-positioned nodes. -->
+<link rel="stylesheet" href="/vendor/drawflow.min.css">
+<script src="/vendor/drawflow.min.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600&family=Orbitron:wght@400;700;900&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  :root {
+    --bg: #050810;
+    --bg2: #0a0f1c;
+    --surface: #111826;
+    --surface2: #161f33;
+    --border: #1e2a42;
+    --accent: #ff6b35;
+    --accent2: #00e5ff;
+    --accent3: #a78bfa;
+    --text: #dbe3f0;
+    --text-dim: #8892a8;
+    --dim: #4a5568;
+    --green: #10b981;
+    --red: #ef4444;
+    --amber: #fbbf24;
+  }
+
+  html, body { height: 100vh; overflow: hidden; }
+
+  body {
+    background:
+      radial-gradient(1200px 800px at 20% 10%, rgba(255,107,53,0.08), transparent 60%),
+      radial-gradient(1000px 700px at 90% 90%, rgba(0,229,255,0.07), transparent 55%),
+      var(--bg);
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  body::before {
+    content: '';
+    position: fixed; inset: 0;
+    background:
+      linear-gradient(90deg, rgba(30,42,66,0.12) 1px, transparent 1px),
+      linear-gradient(rgba(30,42,66,0.12) 1px, transparent 1px);
+    background-size: 48px 48px;
+    pointer-events: none; z-index: 0;
+  }
+
+  .container {
+    display: grid;
+    grid-template-columns: 1fr 380px;
+    grid-template-rows: 64px 1fr 220px;
+    gap: 1px;
+    height: 100vh;
+    position: relative; z-index: 1;
+    background: var(--border);
+    transition: grid-template-columns 0.3s ease;
+  }
+  /* When a pipeline tab is active, collapse the sidebar so the DAG has
+     the whole window to breathe. Sidebar fades out but stays accessible
+     on hover of a thin ghost edge. */
+  .container.pipeline-focus {
+    grid-template-columns: 1fr 0;
+  }
+  .container.pipeline-focus .sidebar {
+    transform: translateX(100%);
+    opacity: 0;
+    pointer-events: none;
+  }
+  .sidebar {
+    transition: transform 0.3s ease, opacity 0.3s ease;
+  }
+
+  /* Header */
+  .header {
+    grid-column: 1 / -1;
+    background: linear-gradient(180deg, var(--surface2), var(--surface));
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 28px;
+    border-bottom: 1px solid var(--border);
+  }
+  .logo {
+    font-family: 'Orbitron', sans-serif;
+    font-weight: 900; font-size: 22px; letter-spacing: 6px;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    filter: drop-shadow(0 0 12px rgba(255,107,53,0.3));
+  }
+  .logo-sub {
+    font-size: 10px; letter-spacing: 4px; color: var(--text-dim);
+    margin-left: 12px; font-weight: 300;
+  }
+  .status-bar {
+    display: flex; gap: 24px; font-size: 11px;
+    color: var(--text-dim); letter-spacing: 1px; text-transform: uppercase;
+    align-items: center;
+  }
+  .status-dot {
+    width: 8px; height: 8px; background: var(--green);
+    border-radius: 50%; display: inline-block; margin-right: 8px;
+    box-shadow: 0 0 12px rgba(16,185,129,0.6);
+    animation: pulse 2.2s ease infinite;
+  }
+  .status-dot.offline { background: var(--red); box-shadow: 0 0 8px rgba(239,68,68,0.5); animation: none; }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(1.3); }
+  }
+  #clock { font-family: 'Orbitron', sans-serif; font-size: 13px; color: var(--accent2); letter-spacing: 2px; }
+
+  .pipeline-tab {
+    cursor: pointer;
+    display: inline-flex; align-items: center;
+    padding: 5px 12px;
+    border-radius: 14px;
+    background: linear-gradient(90deg, rgba(255,107,53,0.2), rgba(0,229,255,0.15));
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    font-family: 'Orbitron', sans-serif; font-weight: 700;
+    letter-spacing: 2px;
+    transition: all 0.2s;
+  }
+  .pipeline-tab:hover { background: linear-gradient(90deg, rgba(255,107,53,0.35), rgba(0,229,255,0.25)); }
+  .tab-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent);
+    margin-right: 8px;
+    box-shadow: 0 0 8px var(--accent);
+    animation: pulse 1.6s ease infinite;
+  }
+
+  /* Tabs container (feed area) — main + dynamically-added pipelines */
+  .tab-area {
+    background: var(--bg2);
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  .tab-bar {
+    display: flex; align-items: center; gap: 2px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 0 10px;
+    height: 40px;
+    flex-shrink: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .tab-bar::-webkit-scrollbar { display: none; }
+  .tab {
+    padding: 0 18px;
+    height: 32px;
+    display: inline-flex; align-items: center; gap: 8px;
+    font-family: 'Orbitron', sans-serif;
+    font-size: 10px; letter-spacing: 2.5px;
+    color: var(--text-dim);
+    cursor: pointer;
+    border-radius: 6px 6px 0 0;
+    border: 1px solid transparent;
+    border-bottom: none;
+    transition: all 0.15s;
+    position: relative; top: 5px;
+    white-space: nowrap;
+  }
+  .tab:hover { color: var(--text); background: rgba(255,255,255,0.02); }
+  .tab.active {
+    color: var(--accent);
+    background: var(--bg2);
+    border-color: var(--border);
+  }
+  .tab .close-x {
+    opacity: 0.4; font-size: 14px; line-height: 1;
+    transition: opacity 0.15s, color 0.15s;
+  }
+  .tab:hover .close-x { opacity: 1; }
+  .tab .close-x:hover { color: var(--red); }
+  .tab .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--amber);
+    animation: pulse 1.4s ease infinite;
+  }
+  .tab.tab-done .dot { background: var(--green); animation: none; }
+
+  .pane {
+    display: none;
+    flex: 1;
+    overflow: hidden;
+    background: var(--bg2);
+  }
+  .pane.active { display: flex; flex-direction: column; flex: 1; overflow: auto; }
+
+  /* Feed (left column, middle row) */
+  .feed {
+    overflow-y: auto;
+    padding: 20px 24px 24px;
+    display: flex; flex-direction: column; gap: 10px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+    flex: 1;
+  }
+  .feed::-webkit-scrollbar { width: 6px; }
+  .feed::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  .feed-item {
+    padding: 12px 16px;
+    border-radius: 8px;
+    font-size: 13px; line-height: 1.55;
+    border-left: 3px solid;
+    animation: slideIn 0.35s cubic-bezier(0.2, 0.8, 0.3, 1);
+    position: relative;
+  }
+  @keyframes slideIn {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .feed-item.user {
+    background: linear-gradient(90deg, rgba(255,107,53,0.10), rgba(255,107,53,0.02));
+    border-color: var(--accent);
+  }
+  .feed-item.agent {
+    background: linear-gradient(90deg, rgba(0,229,255,0.08), rgba(0,229,255,0.02));
+    border-color: var(--accent2);
+  }
+  .feed-item.tool {
+    background: linear-gradient(90deg, rgba(167,139,250,0.08), rgba(167,139,250,0.02));
+    border-color: var(--accent3);
+    font-size: 12px;
+  }
+  .feed-item.result {
+    background: linear-gradient(90deg, rgba(16,185,129,0.08), rgba(16,185,129,0.02));
+    border-color: var(--green);
+    font-size: 12px;
+  }
+  .feed-item.generating {
+    background: linear-gradient(90deg, rgba(251,191,36,0.10), rgba(251,191,36,0.02));
+    border-color: var(--amber);
+    font-size: 12px;
+  }
+
+  .feed-label {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 2.5px;
+    margin-bottom: 4px; font-weight: 600;
+  }
+  .feed-item.user .feed-label { color: var(--accent); }
+  .feed-item.agent .feed-label { color: var(--accent2); }
+  .feed-item.tool .feed-label { color: var(--accent3); }
+  .feed-item.result .feed-label { color: var(--green); }
+  .feed-item.generating .feed-label { color: var(--amber); }
+  .feed-time { font-size: 10px; color: var(--text-dim); float: right; margin-top: -2px; }
+
+  /* Generating spinner */
+  .spinner {
+    display: inline-block; width: 12px; height: 12px;
+    border: 2px solid rgba(251,191,36,0.25);
+    border-top-color: var(--amber);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    vertical-align: middle; margin-right: 8px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Inline image in feed */
+  .feed-image {
+    margin-top: 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    max-width: 320px; max-height: 240px;
+    display: block; cursor: pointer;
+    transition: transform 0.25s ease, box-shadow 0.25s ease;
+    animation: revealImg 0.6s cubic-bezier(0.2, 0.8, 0.3, 1);
+  }
+  .feed-image:hover { transform: scale(1.02); box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
+  @keyframes revealImg {
+    from { opacity: 0; filter: blur(12px); transform: scale(0.96); }
+    to { opacity: 1; filter: blur(0); transform: scale(1); }
+  }
+
+  /* Typewriter effect */
+  .typing-cursor::after {
+    content: '▌'; color: var(--accent2);
+    animation: blink 1s steps(2) infinite;
+    margin-left: 2px;
+  }
+  @keyframes blink { to { opacity: 0; } }
+
+  /* Right sidebar: gallery + stats */
+  .sidebar {
+    background: var(--surface);
+    overflow-y: auto;
+    display: flex; flex-direction: column;
+    scrollbar-width: thin; scrollbar-color: var(--border) transparent;
+  }
+  .sidebar::-webkit-scrollbar { width: 6px; }
+  .sidebar::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  .panel {
+    padding: 16px 18px;
+    border-bottom: 1px solid var(--border);
+  }
+  .panel-title {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 10px; letter-spacing: 3.5px;
+    color: var(--text-dim); text-transform: uppercase;
+    margin-bottom: 12px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .panel-title .count {
+    font-family: 'JetBrains Mono';
+    color: var(--accent2); font-weight: 700; letter-spacing: 1px;
+    font-size: 11px;
+  }
+
+  /* Stats grid */
+  .stats-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+  }
+  .stat-card {
+    background: rgba(255,255,255,0.02);
+    border: 1px solid var(--border);
+    border-radius: 6px; padding: 12px;
+    text-align: center;
+    transition: border-color 0.3s ease;
+  }
+  .stat-card.pulse { border-color: var(--accent2); animation: cardPulse 0.6s ease; }
+  @keyframes cardPulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(0,229,255,0); }
+    50% { box-shadow: 0 0 0 6px rgba(0,229,255,0.15); }
+  }
+  .stat-value {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 24px; font-weight: 700;
+    background: linear-gradient(135deg, var(--accent2), var(--accent3));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .stat-label {
+    font-size: 9px; color: var(--text-dim);
+    letter-spacing: 2.5px; text-transform: uppercase; margin-top: 4px;
+  }
+
+  /* Gallery */
+  .gallery {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+  .gallery-item {
+    aspect-ratio: 1 / 1;
+    background: rgba(255,255,255,0.02);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+    cursor: pointer;
+    position: relative;
+    transition: transform 0.2s ease, border-color 0.2s ease;
+    animation: revealImg 0.45s ease;
+  }
+  .gallery-item:hover { transform: translateY(-2px); border-color: var(--accent2); }
+  .gallery-item img {
+    width: 100%; height: 100%; object-fit: cover;
+    transition: transform 0.3s ease;
+  }
+  .gallery-item:hover img { transform: scale(1.05); }
+  .gallery-item .caption {
+    position: absolute; bottom: 0; left: 0; right: 0;
+    background: linear-gradient(transparent, rgba(0,0,0,0.85));
+    color: var(--text); padding: 16px 8px 6px;
+    font-size: 10px; letter-spacing: 1px;
+    text-transform: uppercase;
+  }
+  .gallery-empty { color: var(--text-dim); font-size: 11px; text-align: center; padding: 20px 0; }
+
+  /* Command suggestions */
+  .chips {
+    display: flex; flex-wrap: wrap; gap: 6px;
+  }
+  .chip {
+    padding: 6px 12px;
+    background: rgba(167,139,250,0.08);
+    border: 1px solid rgba(167,139,250,0.3);
+    border-radius: 14px;
+    font-size: 10px; color: var(--accent3);
+    cursor: pointer; letter-spacing: 0.5px;
+    transition: all 0.2s ease;
+  }
+  .chip:hover {
+    background: rgba(167,139,250,0.2);
+    border-color: var(--accent3);
+    transform: translateY(-1px);
+  }
+
+  /* Waveform + input (bottom row) */
+  .control-strip {
+    grid-column: 1 / -1;
+    background: linear-gradient(180deg, var(--surface), var(--surface2));
+    position: relative; overflow: hidden;
+    display: flex; flex-direction: column;
+  }
+  .waveform-wrap {
+    flex: 1;
+    display: flex; align-items: center; justify-content: center;
+    position: relative; padding: 16px;
+  }
+  .waveform {
+    display: flex; align-items: center; gap: 3px; height: 100px;
+  }
+  .wave-bar {
+    width: 4px;
+    background: var(--accent);
+    border-radius: 2px;
+    transition: height 0.08s ease;
+    opacity: 0.5;
+  }
+  .wave-bar:nth-child(3n) { background: var(--accent2); }
+  .wave-bar:nth-child(5n) { background: var(--accent3); }
+
+  .op-status {
+    position: absolute; top: 16px; left: 50%; transform: translateX(-50%);
+    font-family: 'Orbitron', sans-serif;
+    font-size: 11px; letter-spacing: 4px;
+    color: var(--text-dim); text-transform: uppercase;
+  }
+  .op-status.active { color: var(--amber); }
+  .op-status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--amber); margin-right: 8px; animation: pulse 1.2s ease infinite; vertical-align: middle; }
+
+  .input-bar {
+    display: flex; gap: 10px;
+    padding: 14px 24px 18px;
+    border-top: 1px solid var(--border);
+    background: var(--bg2);
+  }
+  .input-bar input {
+    flex: 1;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 18px;
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px; outline: none;
+    transition: border-color 0.25s;
+  }
+  .input-bar input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(255,107,53,0.1); }
+  .input-bar button {
+    background: linear-gradient(135deg, var(--accent), #e95a28);
+    border: none; border-radius: 8px;
+    padding: 0 28px;
+    color: white;
+    font-family: 'Orbitron', sans-serif;
+    font-size: 11px; letter-spacing: 3px; font-weight: 700;
+    cursor: pointer;
+    transition: all 0.2s ease;
+  }
+  .input-bar button:hover { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(255,107,53,0.4); }
+  .input-bar button:active { transform: translateY(0); }
+  .input-bar button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+  /* Empty state */
+  .empty-state {
+    display: flex; align-items: center; justify-content: center;
+    height: 100%; color: var(--text-dim); font-size: 13px;
+    flex-direction: column; gap: 8px;
+  }
+  .empty-state .big {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 36px; letter-spacing: 8px;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    opacity: 0.25;
+  }
+
+
+  /* ════════════════════════════════════════════════════════════════
+     PIPELINE PANE — clean dark-theme adaptation of the Dribbble reference
+     Single source of truth. Replaces the prior layered CSS.
+     ════════════════════════════════════════════════════════════════ */
+
+  /* Scoped CSS variables for the pipeline pane only — dark, on-brand. */
+  .pane[id^="pane-p-"] {
+    --p-canvas:       #0d1220;
+    --p-card:         #141a28;
+    --p-card-hover:   #1a2134;
+    --p-border:       #232d45;
+    --p-border-soft:  #1a2238;
+    --p-text:         #e6ebf5;
+    --p-dim:          #7f8aa3;
+    --p-muted:        #4e5872;
+    --p-accent:       #ff6b35;    /* LOTUS orange */
+    --p-accent-soft:  rgba(255,107,53,0.15);
+    --p-green:        #10b981;
+    --p-green-soft:   rgba(16,185,129,0.15);
+    --p-amber:        #fbbf24;
+    --p-amber-soft:   rgba(251,191,36,0.15);
+    --p-cyan:         #00e5ff;
+    --p-cyan-soft:    rgba(0,229,255,0.12);
+    --p-violet:       #a78bfa;
+    --p-violet-soft:  rgba(167,139,250,0.14);
+    --p-red:          #ef4444;
+    --p-red-soft:     rgba(239,68,68,0.14);
+    --p-wire:         rgba(122,133,153,0.3);
+    --p-wire-done:    #10b981;
+    --p-wire-active:  #ff6b35;
+  }
+
+  /* Top-level pipeline-pane body wrapper (created in JS as pbody-<id>) */
+  .pane[id^="pane-p-"] > div[id^="pbody-"] {
+    padding: 24px 28px 32px;
+  }
+
+  /* ─── Pipeline header (title, runtime, status chip) ─────────────── */
+  .dag-header {
+    display: flex; align-items: center; gap: 16px;
+    margin-bottom: 20px;
+  }
+  .dag-header > span:nth-child(2) {
+    font: 700 20px/1.2 system-ui, 'Helvetica Neue', sans-serif;
+    letter-spacing: -0.015em;
+    color: var(--p-text);
+  }
+  .dag-runtime {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px; letter-spacing: 0.5px;
+    color: var(--p-dim);
+    background: rgba(255,255,255,0.025);
+    border: 1px solid var(--p-border-soft);
+    padding: 4px 10px;
+    border-radius: 6px;
+  }
+  .dag-status {
+    font: 600 10px/1 system-ui, sans-serif;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    padding: 6px 12px;
+    border-radius: 999px;
+    border: 1px solid transparent;
+  }
+  .dag-status.running { color: var(--p-amber); background: var(--p-amber-soft); }
+  .dag-status.done    { color: var(--p-green); background: var(--p-green-soft); }
+  .dag-status.idle    { color: var(--p-dim);   background: rgba(122,133,153,0.12); }
+
+  /* ─── Banners (processing / error) ──────────────────────────────── */
+  .live-proc, .err-banner {
+    padding: 12px 16px;
+    margin-bottom: 16px;
+    border-radius: 10px;
+    font-size: 13px;
+    display: flex; align-items: center; gap: 12px;
+  }
+  .live-proc {
+    background: var(--p-amber-soft);
+    border: 1px solid rgba(251,191,36,0.35);
+    color: var(--p-amber);
+    position: relative; overflow: hidden;
+  }
+  .live-proc::after {
+    content: ''; position: absolute; inset: 0 auto 0 -30%;
+    width: 30%;
+    background: linear-gradient(90deg, transparent, rgba(251,191,36,0.25), transparent);
+    animation: sweep 1.6s linear infinite;
+  }
+  @keyframes sweep { to { transform: translateX(500%); } }
+  .live-proc-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--p-amber);
+    box-shadow: 0 0 10px var(--p-amber);
+    animation: pulse 1.4s ease infinite;
+  }
+  .err-banner {
+    background: var(--p-red-soft);
+    border: 1px solid rgba(239,68,68,0.45);
+    color: var(--p-red);
+    animation: shake 0.45s cubic-bezier(0.36, 0.07, 0.19, 0.97);
+  }
+  @keyframes shake {
+    10%, 90% { transform: translateX(-1px); }
+    20%, 80% { transform: translateX(2px); }
+    30%, 50%, 70% { transform: translateX(-4px); }
+    40%, 60% { transform: translateX(4px); }
+  }
+
+  /* ─── Canvas with dotted grid ───────────────────────────────────── */
+  .dag-scene {
+    background-color: var(--p-canvas);
+    background-image: radial-gradient(circle, rgba(255,255,255,0.05) 1.2px, transparent 1.6px);
+    background-size: 24px 24px;
+    border: 1px solid var(--p-border-soft);
+    border-radius: 14px;
+    padding: 16px;
+    min-height: 440px;
+    overflow: hidden;
+  }
+
+  /* ─── Drawflow theme overrides — match LOTUS dark palette ──────── */
+  .pane[id^="pane-p-"] .drawflow {
+    background: transparent;
+    width: 100%; height: 100%;
+    min-height: 420px;
+  }
+  .pane[id^="pane-p-"] .drawflow .drawflow-node {
+    background: transparent;
+    border: none;
+    padding: 0;
+    min-width: 290px;
+    box-shadow: none;
+  }
+  .pane[id^="pane-p-"] .drawflow .drawflow-node.selected { background: transparent; }
+  .pane[id^="pane-p-"] .drawflow .drawflow-node .inputs,
+  .pane[id^="pane-p-"] .drawflow .drawflow-node .outputs {
+    display: none;   /* hide default circle ports — we use full cards */
+  }
+  /* Real node body: our custom card */
+  .dag-node-card {
+    background: var(--p-card);
+    border: 1px solid var(--p-border);
+    border-radius: 14px;
+    padding: 18px 20px 20px;
+    min-height: 160px;
+    min-width: 280px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.4);
+    transition: border-color 0.25s, box-shadow 0.25s, transform 0.25s;
+  }
+  .dag-node-card:hover {
+    border-color: var(--p-muted);
+    transform: translateY(-2px);
+    box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+  }
+  .dag-node-card.active {
+    border-color: var(--p-accent);
+    box-shadow: 0 0 0 1px var(--p-accent), 0 10px 28px rgba(255,107,53,0.25);
+  }
+  .dag-node-card.done    { border-color: rgba(16,185,129,0.45); }
+  .dag-node-card.pending { opacity: 0.9; }
+
+  /* Connector paths Drawflow draws between nodes */
+  .pane[id^="pane-p-"] .drawflow .connection .main-path {
+    stroke: var(--p-wire);
+    stroke-width: 2.5;
+    stroke-linecap: round;
+    fill: none;
+  }
+  .pane[id^="pane-p-"] .drawflow .connection.done .main-path {
+    stroke: var(--p-wire-done);
+    stroke-width: 3;
+  }
+  .pane[id^="pane-p-"] .drawflow .connection.active .main-path {
+    stroke: var(--p-wire-active);
+    stroke-width: 3.5;
+    stroke-dasharray: 10 12;
+    animation: wireFlow 0.8s linear infinite;
+    filter: drop-shadow(0 0 8px rgba(255,107,53,0.55));
+  }
+
+  /* Tweak Drawflow input/output selection markers away */
+  .pane[id^="pane-p-"] .drawflow .drawflow-node .title-box { display: none; }
+  .dag {
+    position: relative;
+    overflow-x: auto; overflow-y: visible;
+  }
+  .dag::-webkit-scrollbar { height: 6px; }
+  .dag::-webkit-scrollbar-thumb { background: var(--p-border); border-radius: 3px; }
+  .dag-wrap {
+    position: relative;
+    display: flex; align-items: stretch;
+    gap: 110px;
+    padding: 10px 12px 20px;
+    min-width: max-content;
+  }
+  .dag-svg {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* ─── Node card ─────────────────────────────────────────────────── */
+  .dag-card {
+    position: relative; z-index: 1;
+    min-width: 290px; max-width: 320px;
+    min-height: 170px;
+    background: var(--p-card);
+    border: 1px solid var(--p-border);
+    border-radius: 14px;
+    padding: 18px 20px 20px;
+    display: flex; flex-direction: column;
+    cursor: pointer;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.4);
+    transition: transform 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease, background 0.25s ease;
+    animation: nodeIn 0.45s cubic-bezier(0.2, 0.8, 0.3, 1) both;
+  }
+  @keyframes nodeIn {
+    from { opacity: 0; transform: translateY(10px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .dag-card:hover {
+    background: var(--p-card-hover);
+    border-color: var(--p-muted);
+    transform: translateY(-3px);
+    box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+  }
+  .dag-card.active {
+    border-color: var(--p-accent);
+    box-shadow: 0 0 0 1px var(--p-accent), 0 10px 28px rgba(255,107,53,0.25);
+  }
+  .dag-card.done {
+    border-color: rgba(16,185,129,0.45);
+  }
+  .dag-card.selected {
+    border-color: var(--p-accent);
+    box-shadow: 0 0 0 2px var(--p-accent), 0 12px 32px rgba(255,107,53,0.3);
+  }
+
+  /* Header row of a node: icon (left) + status pill (right) */
+  .dag-node-head {
+    display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 12px; margin-bottom: 14px;
+  }
+  .dag-icon {
+    width: 44px; height: 44px; border-radius: 10px;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 22px; font-weight: 700;
+    flex-shrink: 0;
+    transition: transform 0.3s ease;
+  }
+  .dag-icon.cyan   { background: var(--p-cyan-soft);   color: var(--p-cyan); }
+  .dag-icon.amber  { background: var(--p-amber-soft);  color: var(--p-amber); }
+  .dag-icon.violet { background: var(--p-violet-soft); color: var(--p-violet); }
+  .dag-icon.green  { background: var(--p-green-soft);  color: var(--p-green); }
+  .dag-icon.accent { background: var(--p-accent-soft); color: var(--p-accent); }
+  .dag-card.pending .dag-icon,
+  .dag-card:not(.active):not(.done):not(.selected) .dag-icon { opacity: 0.55; }
+  .dag-card.active .dag-icon { animation: iconPulse 1.5s ease infinite; }
+  .dag-card.active[data-stage="generating"] .dag-icon { animation: iconSpin 2.4s linear infinite; }
+  .dag-card.done   .dag-icon { animation: iconBounce 0.55s cubic-bezier(0.2, 1.3, 0.4, 1); }
+  @keyframes iconPulse {
+    0%, 100% { transform: scale(1); }
+    50%      { transform: scale(1.08); }
+  }
+  @keyframes iconSpin { to { transform: rotate(360deg); } }
+  @keyframes iconBounce {
+    0%   { transform: scale(0.55); }
+    60%  { transform: scale(1.12); }
+    100% { transform: scale(1); }
+  }
+
+  .dag-status-pill {
+    font: 600 10px/1 system-ui, sans-serif;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+    padding: 6px 11px;
+    border-radius: 999px;
+    white-space: nowrap;
+    display: inline-flex; align-items: center; gap: 5px;
+  }
+  .dag-status-pill::before {
+    content: ''; width: 6px; height: 6px; border-radius: 50%;
+    background: currentColor;
+  }
+  .dag-status-pill.pending { color: var(--p-dim);   background: rgba(122,133,153,0.15); }
+  .dag-status-pill.active  { color: var(--p-amber); background: var(--p-amber-soft); }
+  .dag-status-pill.done    { color: var(--p-green); background: var(--p-green-soft); }
+
+  .dag-card-title {
+    font: 700 16px/1.25 system-ui, 'Helvetica Neue', sans-serif;
+    letter-spacing: -0.01em;
+    color: var(--p-text);
+    margin-bottom: 10px;
+  }
+  .dag-card-sub {
+    font-size: 12px; line-height: 1.5;
+    color: var(--p-dim);
+    flex: 1;
+  }
+  .dag-card-footer {
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px dashed var(--p-border-soft);
+    font-size: 11px;
+    color: var(--p-dim);
+    letter-spacing: 0.3px;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+
+  /* ─── Wires (SVG) ───────────────────────────────────────────────── */
+  .wire { fill: none; stroke-linecap: round; }
+  .wire.pending { stroke: var(--p-wire);        stroke-width: 2; }
+  .wire.done    { stroke: var(--p-wire-done);   stroke-width: 2.5; }
+  .wire.active  {
+    stroke: var(--p-wire-active);
+    stroke-width: 3;
+    stroke-dasharray: 10 12;
+    animation: wireFlow 0.8s linear infinite;
+    filter: drop-shadow(0 0 10px rgba(255,107,53,0.55));
+  }
+  @keyframes wireFlow { to { stroke-dashoffset: -22; } }
+
+  /* ─── Stage-detail panel (click a card to expand) ──────────────── */
+  .stage-detail {
+    margin-top: 24px;
+    background: var(--p-card);
+    border: 1px solid var(--p-border);
+    border-radius: 14px;
+    padding: 22px 26px;
+    animation: nodeIn 0.35s cubic-bezier(0.2, 0.8, 0.3, 1);
+  }
+  .stage-detail-header {
+    display: flex; align-items: center; gap: 14px;
+    margin-bottom: 16px;
+    padding-bottom: 14px;
+    border-bottom: 1px solid var(--p-border-soft);
+  }
+  .stage-detail-title {
+    font: 700 17px/1.2 system-ui, sans-serif;
+    letter-spacing: -0.01em;
+    color: var(--p-text);
+  }
+  .stage-detail-sub {
+    font-size: 11px; color: var(--p-dim);
+    letter-spacing: 1.2px; text-transform: uppercase;
+    margin-top: 2px;
+  }
+
+  /* ─── Metrics rail (Pipeline Metrics & Insights card) ───────────── */
+  .pipe-metrics {
+    margin-top: 22px;
+    background: var(--p-card);
+    border: 1px solid var(--p-border);
+    border-radius: 14px;
+    padding: 22px 26px;
+  }
+  .pipe-metrics-title {
+    font: 700 14px/1.2 system-ui, sans-serif;
+    letter-spacing: -0.005em;
+    color: var(--p-text);
+    margin-bottom: 16px;
+  }
+  .pipe-metrics-grid {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
+    margin-bottom: 18px;
+  }
+  .pipe-metric {
+    background: rgba(255,255,255,0.02);
+    border: 1px solid var(--p-border-soft);
+    border-radius: 10px;
+    padding: 14px;
+    text-align: center;
+  }
+  .pipe-metric-value {
+    font: 700 26px/1 system-ui, sans-serif;
+    letter-spacing: -0.02em;
+    color: var(--p-text);
+  }
+  .pipe-metric-label {
+    font-size: 10px; color: var(--p-dim);
+    letter-spacing: 1.5px; text-transform: uppercase;
+    margin-top: 6px;
+  }
+  .pipe-bars {
+    display: flex; align-items: flex-end; gap: 10px;
+    height: 72px;
+    padding-bottom: 22px;
+  }
+  .pipe-bar {
+    flex: 1;
+    background: linear-gradient(180deg, var(--p-accent), rgba(255,107,53,0.35));
+    border-radius: 4px 4px 0 0;
+    min-height: 4px;
+    position: relative;
+    transition: height 0.4s ease;
+  }
+  .pipe-bar.done    { background: linear-gradient(180deg, var(--p-green), rgba(16,185,129,0.35)); }
+  .pipe-bar.pending { background: rgba(122,133,153,0.22); }
+  .pipe-bar::after {
+    content: attr(data-label);
+    position: absolute; bottom: -18px; left: 50%;
+    transform: translateX(-50%);
+    font-size: 9px; color: var(--p-dim);
+    letter-spacing: 0.5px; text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  /* ─── Action area below (approve / deny / save) ─────────────────── */
+  .dag-actions {
+    margin-top: 22px;
+    background: var(--p-card);
+    border: 1px solid var(--p-border);
+    border-radius: 14px;
+    padding: 22px 26px;
+  }
+  .dag-actions-title {
+    font: 700 13px/1.2 system-ui, sans-serif;
+    letter-spacing: 0;
+    color: var(--p-text);
+    margin-bottom: 14px;
+    text-transform: none;
+  }
+
+  /* Buttons inside the pipeline pane */
+  .pane[id^="pane-p-"] .p-btn {
+    background: rgba(255,255,255,0.025);
+    border: 1px solid var(--p-border);
+    color: var(--p-text);
+    border-radius: 8px;
+    padding: 8px 14px;
+    font: 600 12px/1 system-ui, sans-serif;
+    cursor: pointer;
+    transition: all 0.18s ease;
+  }
+  .pane[id^="pane-p-"] .p-btn:hover {
+    background: rgba(255,255,255,0.05);
+    border-color: var(--p-muted);
+  }
+  .pane[id^="pane-p-"] .p-btn.primary {
+    background: var(--p-accent);
+    color: #ffffff;
+    border-color: transparent;
+  }
+  .pane[id^="pane-p-"] .p-btn.primary:hover { background: #ff8458; }
+  .pane[id^="pane-p-"] .p-btn.approve:hover { color: var(--p-green); border-color: rgba(16,185,129,0.5); background: var(--p-green-soft); }
+  .pane[id^="pane-p-"] .p-btn.deny:hover    { color: var(--p-red);   border-color: rgba(239,68,68,0.5);  background: var(--p-red-soft); }
+
+  /* Prompt cards in action area */
+  .pane[id^="pane-p-"] .p-card {
+    background: rgba(255,255,255,0.018);
+    border: 1px solid var(--p-border-soft);
+    border-left: 3px solid var(--p-muted);
+    border-radius: 8px;
+    padding: 12px 16px;
+    color: var(--p-text);
+    font-size: 13px; line-height: 1.55;
+    margin-bottom: 8px;
+    display: flex; align-items: center; gap: 14px;
+  }
+  .pane[id^="pane-p-"] .p-card.approved { border-left-color: var(--p-green); background: rgba(16,185,129,0.05); }
+  .pane[id^="pane-p-"] .p-card.denied   { border-left-color: var(--p-red);   opacity: 0.55; }
+
+  /* Frame grid in action area */
+  .pane[id^="pane-p-"] .frame-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 14px;
+  }
+  .pane[id^="pane-p-"] .f-card {
+    background: rgba(255,255,255,0.018);
+    border: 1px solid var(--p-border-soft);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .pane[id^="pane-p-"] .f-card.approved { border-color: rgba(16,185,129,0.45); box-shadow: 0 0 0 1px rgba(16,185,129,0.25); }
+  .pane[id^="pane-p-"] .f-card.denied   { opacity: 0.45; }
+
+  /* ─── Conversation / chat inside pane ───────────────────────────── */
+  .pipe-chat {
+    margin-top: 22px;
+    background: var(--p-card);
+    border: 1px solid var(--p-border);
+    border-radius: 14px;
+    padding: 18px 24px;
+  }
+  .pipe-chat-title {
+    font: 700 13px/1.2 system-ui, sans-serif;
+    color: var(--p-text);
+    margin-bottom: 12px;
+  }
+  .pipe-msg {
+    padding: 10px 14px;
+    border-radius: 8px;
+    margin-bottom: 8px;
+    font-size: 13px; line-height: 1.5;
+    border-left: 3px solid transparent;
+    animation: nodeIn 0.3s ease both;
+  }
+  .pipe-msg.user  { background: rgba(255,107,53,0.08); border-left-color: var(--p-accent); color: var(--p-text); }
+  .pipe-msg.agent { background: rgba(0,229,255,0.05);  border-left-color: var(--p-cyan);   color: var(--p-text); }
+  .pipe-msg-label {
+    font-size: 10px; letter-spacing: 1.5px; text-transform: uppercase;
+    color: var(--p-dim); margin-bottom: 4px;
+  }
+  .pipe-msg.user  .pipe-msg-label { color: var(--p-accent); }
+  .pipe-msg.agent .pipe-msg-label { color: var(--p-cyan); }
+
+  /* ─── Done-stage celebration ────────────────────────────────────── */
+  .done-burst {
+    text-align: center;
+    padding: 28px 0 10px;
+    animation: bounceIn 0.75s cubic-bezier(0.2, 0.8, 0.3, 1);
+  }
+  @keyframes bounceIn {
+    0%   { transform: scale(0.4); opacity: 0; }
+    60%  { transform: scale(1.12); opacity: 1; }
+    100% { transform: scale(1); opacity: 1; }
+  }
+  .done-check {
+    width: 68px; height: 68px; border-radius: 50%;
+    background: var(--p-green); color: #042e1c;
+    display: inline-flex; align-items: center; justify-content: center;
+    font: 700 34px/1 system-ui, sans-serif;
+    box-shadow: 0 0 0 4px rgba(16,185,129,0.18), 0 0 30px rgba(16,185,129,0.4);
+  }
+  .tree {
+    background: rgba(255,255,255,0.02);
+    border: 1px solid var(--p-border-soft);
+    border-radius: 10px;
+    padding: 16px 20px;
+    font: 400 12px/1.75 'JetBrains Mono', monospace;
+    color: var(--p-dim);
+  }
+  .tree .b { color: var(--p-cyan); font-weight: 600; }
+
+  /* Lightbox */
+  .lightbox {
+    display: none;
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.92);
+    z-index: 1000;
+    align-items: center; justify-content: center;
+    animation: fade 0.25s ease;
+  }
+  .lightbox.show { display: flex; }
+  .lightbox img { max-width: 92vw; max-height: 88vh; border-radius: 6px; }
+  .lightbox-close {
+    position: absolute; top: 24px; right: 32px;
+    color: var(--text); font-size: 28px; cursor: pointer;
+    width: 44px; height: 44px; display: flex; align-items: center; justify-content: center;
+    border-radius: 50%; background: rgba(255,255,255,0.06);
+    transition: background 0.2s;
+  }
+  .lightbox-close:hover { background: rgba(255,255,255,0.15); }
+  .lightbox-caption {
+    position: absolute; bottom: 24px; left: 0; right: 0; text-align: center;
+    color: var(--text-dim); font-size: 13px; letter-spacing: 2px;
+  }
+  @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+</style>
+</head>
+<body>
+
+<div class="container">
+
+  <!-- Header -->
+  <div class="header">
+    <div>
+      <span class="logo">LOTUS</span>
+      <span class="logo-sub">AGENT · CONTROL CENTER</span>
+    </div>
+    <div class="status-bar">
+      <span><span class="status-dot" id="connDot"></span>WebSocket</span>
+      <span id="clock">--:--:--</span>
+      <span><span id="msgCount">0</span> EVENTS</span>
+    </div>
+  </div>
+
+  <!-- Tab area (left column) — holds Main pane + dynamically added pipeline panes -->
+  <div class="tab-area">
+    <div class="tab-bar" id="tabBar">
+      <div class="tab active" data-tab="main" onclick="switchTab('main')">MAIN</div>
+    </div>
+    <div class="pane active" id="pane-main">
+      <div class="feed" id="feed">
+        <div class="empty-state">
+          <div class="big">LOTUS</div>
+          <span>Say "Lotus, create image of..." or type below</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="panel">
+      <div class="panel-title">Statistics</div>
+      <div class="stats-grid">
+        <div class="stat-card" id="cardCmds">
+          <div class="stat-value" id="statCmds">0</div>
+          <div class="stat-label">Commands</div>
+        </div>
+        <div class="stat-card" id="cardImgs">
+          <div class="stat-value" id="statImgs">0</div>
+          <div class="stat-label">Images</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="statUptime">0m</div>
+          <div class="stat-label">Uptime</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="statFolder">--</div>
+          <div class="stat-label">Today</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">
+        <span>Gallery</span>
+        <span class="count" id="galleryCount">0</span>
+      </div>
+      <div class="gallery" id="gallery">
+        <div class="gallery-empty">No images yet</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">Quick Commands</div>
+      <div class="chips" id="chips">
+        <span class="chip">create image of a single red lotus flower, photorealistic</span>
+        <span class="chip">create image of a vintage brass compass on a map</span>
+        <span class="chip">create image of a minimalist mountain at sunset</span>
+        <span class="chip">show image settings</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Bottom: waveform + input -->
+  <div class="control-strip">
+    <div class="waveform-wrap">
+      <div class="op-status" id="opStatus">Idle</div>
+      <div class="waveform" id="waveform"></div>
+    </div>
+    <div class="input-bar">
+      <input type="text" id="cmdInput" placeholder='Type a command, e.g. "create image of a tabby cat in morning light"' />
+      <button id="sendBtn" onclick="sendCmd()">SEND</button>
+    </div>
+  </div>
+</div>
+
+<!-- Pipeline panes are created dynamically inside .tab-area when a
+     pipeline_state event arrives. No fixed overlay anymore. -->
+
+<!-- Lightbox -->
+<div class="lightbox" id="lightbox" onclick="closeLightbox(event)">
+  <span class="lightbox-close" onclick="closeLightbox(event)">✕</span>
+  <img id="lightboxImg" src="" alt="">
+  <div class="lightbox-caption" id="lightboxCaption"></div>
+</div>
+
+<script>
+  // ── State ──────────────────────────────────────────
+  let ws = null;
+  let stats = { cmds: 0, imgs: 0, events: 0 };
+  let startTime = Date.now();
+  let firstMessage = true;
+  let generatingItem = null;   // the "generating..." feed item, if one is active
+  let waveActive = false;
+  let authed = false;
+  let lastBootId = null;           // detect mother-restart → auto-reload
+
+  // ── Auth token (URL ?token= → localStorage → prompt) ─
+  function getToken() {
+    const qs = new URLSearchParams(location.search).get('token');
+    if (qs) {
+      localStorage.setItem('lotus_token', qs);
+      // Strip token from URL for cleanliness
+      const u = new URL(location.href); u.searchParams.delete('token');
+      history.replaceState({}, '', u.toString());
+      return qs;
+    }
+    let t = localStorage.getItem('lotus_token');
+    if (!t) {
+      t = window.prompt('Enter LOTUS auth token (from the mother terminal):');
+      if (t) localStorage.setItem('lotus_token', t.trim());
+    }
+    return t ? t.trim() : '';
+  }
+  const AUTH_TOKEN = getToken();
+
+  // ── Date folder (MMDDYY) ───────────────────────────
+  (function updateTodayFolder(){
+    const d = new Date();
+    const mm = String(d.getMonth()+1).padStart(2,'0');
+    const dd = String(d.getDate()).padStart(2,'0');
+    const yy = String(d.getFullYear()).slice(2);
+    document.getElementById('statFolder').textContent = mm+dd+yy;
+  })();
+
+  // ── Waveform ──────────────────────────────────────
+  const waveContainer = document.getElementById('waveform');
+  for (let i = 0; i < 64; i++) {
+    const bar = document.createElement('div');
+    bar.className = 'wave-bar';
+    bar.style.height = '4px';
+    waveContainer.appendChild(bar);
+  }
+  const waveBars = waveContainer.querySelectorAll('.wave-bar');
+  function animateWave() {
+    waveBars.forEach((bar, i) => {
+      if (waveActive) {
+        const h = 8 + Math.random() * 86;
+        bar.style.height = h + 'px';
+        bar.style.opacity = '0.8';
+      } else {
+        const h = 4 + Math.abs(Math.sin(Date.now()/600 + i*0.25)) * 6;
+        bar.style.height = h + 'px';
+        bar.style.opacity = '0.35';
+      }
+    });
+  }
+  setInterval(animateWave, 80);
+
+  // ── Clock + uptime ─────────────────────────────────
+  setInterval(() => {
+    const now = new Date();
+    document.getElementById('clock').textContent = now.toLocaleTimeString();
+    const mins = Math.floor((Date.now() - startTime) / 60000);
+    document.getElementById('statUptime').textContent =
+      mins < 60 ? mins+'m' : Math.floor(mins/60)+'h'+(mins%60)+'m';
+  }, 1000);
+
+  // ── Pre-populate gallery from today's folder (walks all sections) ──
+  fetch('/api/today').then(r => r.json()).then(data => {
+    if (data && data.folder) {
+      // Show the full parent folder name (Techengine04182026, not just 041826)
+      const el = document.getElementById('statFolder');
+      // Shrink if the name is long so it fits the card
+      el.textContent = data.folder;
+      if (data.folder.length > 10) {
+        el.style.fontSize = '12px';
+        el.style.letterSpacing = '0.5px';
+      }
+    }
+    if (data && data.images) {
+      data.images.forEach(img => {
+        const caption = img.section && img.section !== '(root)'
+          ? `${img.section}/${img.name}` : img.name;
+        addToGallery(img.url, img.name, caption);
+      });
+    }
+  }).catch(() => {});
+
+  // ── WebSocket ──────────────────────────────────────
+  function wsUrl() {
+    // Use the same host the dashboard was served from, on port 8765
+    const host = location.hostname || 'localhost';
+    return `ws://${host}:8765`;
+  }
+
+  function connect() {
+    ws = new WebSocket(wsUrl());
+
+    ws.onopen = () => {
+      document.getElementById('connDot').classList.remove('offline');
+      setOp('Connected — Authenticating', true);
+      document.getElementById('sendBtn').disabled = true;
+      authed = false;
+    };
+
+    ws.onclose = () => {
+      document.getElementById('connDot').classList.add('offline');
+      setOp('Disconnected', false);
+      document.getElementById('sendBtn').disabled = true;
+      authed = false;
+      setTimeout(connect, 2500);
+    };
+
+    ws.onmessage = (e) => {
+      let data;
+      try { data = JSON.parse(e.data); } catch(err) { return; }
+
+      // Auth handshake: respond to the server's initial auth_required
+      if (data.type === 'auth_required') {
+        ws.send(JSON.stringify({ type: 'auth', token: AUTH_TOKEN }));
+        return;
+      }
+      if (data.type === 'auth_ok') {
+        authed = true;
+        setOp('Connected — Idle', false);
+        document.getElementById('sendBtn').disabled = false;
+        return;
+      }
+      if (data.type === 'connected') {
+        // Mother's boot_id changes on restart. If we'd already seen a
+        // different one, the mother was restarted — reload the page to
+        // pick up any new dashboard HTML.
+        const bid = data.boot_id;
+        if (bid) {
+          if (lastBootId && lastBootId !== bid) {
+            location.reload();
+            return;
+          }
+          lastBootId = bid;
+        }
+        return;
+      }
+      if (data.type === 'auth_failed') {
+        setOp('Auth failed — check token', false);
+        localStorage.removeItem('lotus_token');
+        alert('Auth failed — token rejected. Refresh the page to re-enter.');
+        return;
+      }
+
+      // Pipeline events
+      if (data.type === 'pipeline_state') {
+        renderPipeline(data);
+        return;
+      }
+      if (data.type === 'pipeline_cancel') {
+        const pid = data.id || (pipelineState && pipelineState.id);
+        if (pid) closePipelineTab(pid);
+        return;
+      }
+      // Agent-triggered hard reload ("Lotus, refresh yourself")
+      if (data.type === 'reload') {
+        location.reload();
+        return;
+      }
+
+      handleEvent(data);
+    };
+  }
+  connect();
+
+  // ── Pipeline UI ──────────────────────────────────────────────────
+  let pipelineState = null;
+  const PIPELINE_STAGES = [
+    { key: 'ask_location',   label: '1. Source' },
+    { key: 'review_prompts', label: '2. Review Prompts' },
+    { key: 'generating',     label: '3. Generate' },
+    { key: 'review_frames',  label: '4. Review Frames' },
+    { key: 'save',           label: '5. Save' },
+    { key: 'done',           label: '6. Done' },
+  ];
+
+  let pipelineStartTimes = {};         // { pid: startMs }
+  let activeTab = 'main';
+
+  function ensurePipelineTab(pid, name, stage) {
+    const tabBar = document.getElementById('tabBar');
+    let tab = tabBar.querySelector(`[data-tab="p-${pid}"]`);
+    const isDone = stage === 'done';
+    const label = name || `Pipeline ${pid}`;
+    if (!tab) {
+      tab = document.createElement('div');
+      tab.className = 'tab';
+      tab.setAttribute('data-tab', `p-${pid}`);
+      tab.innerHTML = `<span class="dot"></span><span class="tname"></span><span class="close-x" title="Close">×</span>`;
+      tab.querySelector('.tname').textContent = label;
+      tab.onclick = (e) => {
+        if (e.target.classList.contains('close-x')) {
+          closePipelineTab(pid);
+        } else {
+          switchTab(`p-${pid}`);
+        }
+      };
+      tabBar.appendChild(tab);
+
+      // Create the pane
+      const tabArea = document.querySelector('.tab-area');
+      const pane = document.createElement('div');
+      pane.className = 'pane';
+      pane.id = `pane-p-${pid}`;
+      pane.innerHTML = `<div id="pbody-${pid}" style="padding:18px 22px 24px;overflow:auto;flex:1"></div>`;
+      tabArea.appendChild(pane);
+
+      // Auto-switch to new pipeline on creation
+      switchTab(`p-${pid}`);
+      pipelineStartTimes[pid] = Date.now();
+    } else {
+      tab.querySelector('.tname').textContent = label;
+    }
+    tab.classList.toggle('tab-done', isDone);
+  }
+
+  function switchTab(tabId) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tabId));
+    document.querySelectorAll('.pane').forEach(p => {
+      const want = tabId === 'main' ? 'pane-main' : `pane-${tabId}`;
+      p.classList.toggle('active', p.id === want);
+    });
+    activeTab = tabId;
+    // Focus mode: hide sidebar when viewing a pipeline so the DAG has
+    // the whole width to breathe. Main tab restores sidebar.
+    const container = document.querySelector('.container');
+    if (container) {
+      container.classList.toggle('pipeline-focus', tabId.startsWith('p-'));
+    }
+    if (tabId.startsWith('p-')) {
+      // Redraw connectors after the CSS transition finishes so SVG sizes
+      // reflect the new pane width.
+      setTimeout(drawConnectors, 320);
+    }
+  }
+
+  function closePipelineTab(pid) {
+    document.querySelector(`[data-tab="p-${pid}"]`)?.remove();
+    document.getElementById(`pane-p-${pid}`)?.remove();
+    delete pipelineStartTimes[pid];
+    if (pipelineState && pipelineState.id === pid) {
+      // Signal the agent to cancel
+      pipeSend('pipeline_cancel', { id: pid });
+      pipelineState = null;
+    }
+    switchTab('main');
+  }
+
+  // Track per-pipeline chat messages so we can render them inside the tab
+  let pipelineChats = {};   // { pid: [{role, text, time}] }
+
+  function pipelineChatAppend(pid, role, text) {
+    if (!pipelineChats[pid]) pipelineChats[pid] = [];
+    pipelineChats[pid].push({ role, text, time: new Date().toLocaleTimeString() });
+    // keep last 20
+    if (pipelineChats[pid].length > 20) pipelineChats[pid].shift();
+  }
+
+  // Per-pipeline Drawflow editor instances (one per tab)
+  let pipelineEditors = {};
+
+  function renderPipeline(data) {
+    pipelineState = data;
+    if (!pipelineStartTimes[data.id]) pipelineStartTimes[data.id] = Date.now();
+    ensurePipelineTab(data.id, data.name, data.stage);
+    const body = document.getElementById(`pbody-${data.id}`);
+    if (!body) return;
+    body.innerHTML = renderDAGHeader(data)
+                   + `<div class="dag-scene" id="dagScene-${data.id}">
+                        <div id="drawflow-${data.id}" style="height:400px;position:relative"></div>
+                      </div>`
+                   + renderStageDetail(data)
+                   + renderMetrics(data) + renderActions(data) + renderChat(data);
+    // Build or update the Drawflow editor
+    setTimeout(() => mountOrUpdateDrawflow(data), 20);
+  }
+
+  function renderDAGHeader(d) {
+    const activeIdx = PIPELINE_STAGES.findIndex(s => s.key === d.stage);
+    const isDone = d.stage === 'done';
+    const start = pipelineStartTimes[d.id] || Date.now();
+    const runtime = fmtRuntime(Date.now() - start);
+    const statusCls = isDone ? 'done' : (d.stage === 'ask_location' ? 'idle' : 'running');
+    const statusTxt = isDone ? 'Passed' : (d.stage === 'ask_location' ? 'Idle' : 'Running');
+    const procBanner = d.processing
+      ? `<div class="live-proc">
+           <span class="live-proc-dot"></span>
+           <span class="live-proc-text">${escapeHtml(d.processing_label || 'Processing…')}</span>
+         </div>`
+      : '';
+    const errBanner = d.error
+      ? `<div class="err-banner">⚠ ${escapeHtml(d.error)}</div>` : '';
+    return `
+      <div class="dag-header">
+        <span class="dag-runtime" id="dagRuntime-${d.id}">${runtime}</span>
+        <span>${escapeHtml(d.name || 'LOTUS Content Pipeline')}</span>
+        <span class="dag-status ${statusCls}">${statusTxt}</span>
+      </div>
+      ${procBanner}
+      ${errBanner}`;
+  }
+
+  function stageMeta(key) {
+    return ({
+      ask_location:   { icon: '📄', color: 'cyan',   title: 'Source',       desc: 'Pick the markdown file with your NB2 prompts.' },
+      review_prompts: { icon: '📝', color: 'amber',  title: 'Prompts',      desc: 'Gemma parses prompts and auto-approves.' },
+      generating:     { icon: '⚙',  color: 'violet', title: 'Generate',     desc: 'Gemini produces each frame from its prompt.' },
+      review_frames:  { icon: '🖼', color: 'violet', title: 'Review Frames',desc: 'Approve, deny, or regenerate each image.' },
+      save:           { icon: '💾', color: 'accent', title: 'Save',         desc: 'Drop approved frames into the destination folder.' },
+      done:           { icon: '✓',  color: 'green',  title: 'Complete',    desc: 'All frames saved with the correct hierarchy.' },
+    })[key] || { icon: '•', color: 'violet', title: key, desc: '' };
+  }
+
+  function nodeHtml(key, cls, pillCls, pillTxt, meta) {
+    return `
+      <div class="dag-node-card ${cls}" data-stage="${key}">
+        <div class="dag-node-head">
+          <span class="dag-icon ${meta.color}">${meta.icon}</span>
+          <span class="dag-status-pill ${pillCls}">${pillTxt}</span>
+        </div>
+        <div class="dag-card-title">${meta.title}</div>
+        <div class="dag-card-sub">${meta.desc}</div>
+      </div>`;
+  }
+
+  function mountOrUpdateDrawflow(data) {
+    const containerId = `drawflow-${data.id}`;
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    // Tear down existing editor for this pipeline so we rebuild cleanly
+    if (pipelineEditors[data.id]) {
+      try { pipelineEditors[data.id].clear(); } catch(e) {}
+    }
+    container.innerHTML = '';
+    const editor = new Drawflow(container);
+    editor.reroute = true;
+    editor.reroute_fix_curvature = true;
+    editor.force_first_input = false;
+    editor.curvature = 0.5;
+    editor.reroute_curvature = 0.5;
+    editor.start();
+    pipelineEditors[data.id] = editor;
+
+    // Place nodes horizontally, spaced so connector arrows have room
+    const activeIdx = PIPELINE_STAGES.findIndex(s => s.key === data.stage);
+    const allDone = data.stage === 'done';
+    const spacing = 330;
+    const y = 40;
+
+    const nodeIds = [];
+    PIPELINE_STAGES.forEach((stage, i) => {
+      const key = stage.key;
+      const cls = i === activeIdx ? 'active' : (i < activeIdx || allDone ? 'done' : 'pending');
+      const pillCls = cls === 'active' ? 'active' : (cls === 'done' ? 'done' : 'pending');
+      const pillTxt = pillCls === 'active' ? 'In Progress' : pillCls === 'done' ? 'Completed' : 'Pending';
+      const meta = stageMeta(key);
+      const html = nodeHtml(key, cls, pillCls, pillTxt, meta);
+      const nId = editor.addNode(
+        key,
+        i === 0 ? 0 : 1,              // inputs
+        i === PIPELINE_STAGES.length - 1 ? 0 : 1,  // outputs
+        50 + i * spacing, y,
+        `lotus-stage ${cls}`,
+        { stage: key },
+        html,
+      );
+      nodeIds.push(nId);
+    });
+
+    // Wire them linearly
+    for (let i = 0; i < nodeIds.length - 1; i++) {
+      editor.addConnection(nodeIds[i], nodeIds[i+1], 'output_1', 'input_1');
+    }
+
+    // Click handler — forward to selectStage
+    editor.on('nodeSelected', (id) => {
+      const node = editor.getNodeFromId(id);
+      if (node && node.data && node.data.stage) selectStage(node.data.stage);
+    });
+
+    // Apply active/done classes to connection SVGs after render
+    setTimeout(() => tagConnections(editor, activeIdx, allDone), 50);
+  }
+
+  function tagConnections(editor, activeIdx, allDone) {
+    const svgs = editor.precanvas.querySelectorAll('.connection');
+    svgs.forEach((svg, i) => {
+      svg.classList.remove('done', 'active', 'pending');
+      if (i < activeIdx || allDone)       svg.classList.add('done');
+      else if (i === activeIdx - 1)       svg.classList.add('active');
+      else                                svg.classList.add('pending');
+    });
+  }
+
+  function renderMetrics(d) {
+    const ps = d.prompts || [];
+    const fs = d.frames  || [];
+    const approvedP = ps.filter(p => p.status === 'approved').length;
+    const readyF    = fs.filter(f => ['pending_review','approved'].includes(f.status)).length;
+    const savedF    = fs.filter(f => f.final_url).length;
+    const failedF   = fs.filter(f => f.status === 'failed').length;
+
+    // Bar chart — one bar per stage, height reflects "items completed"
+    const stages = [
+      { label: 'Src',    val: d.source_md ? 1 : 0, max: 1 },
+      { label: 'Prompt', val: ps.length, max: Math.max(1, ps.length) },
+      { label: 'Gen',    val: fs.length, max: Math.max(1, ps.length) },
+      { label: 'Review', val: readyF, max: Math.max(1, fs.length) },
+      { label: 'Save',   val: savedF, max: Math.max(1, fs.length) },
+    ];
+    const bars = stages.map(s => {
+      const pct = s.max ? Math.min(100, (s.val / s.max) * 100) : 0;
+      const cls = pct >= 100 ? 'done' : (pct > 0 ? '' : 'pending');
+      return `<div class="pipe-bar ${cls}" style="height:${Math.max(6, pct*0.8)}%" data-label="${s.label}"></div>`;
+    }).join('');
+
+    return `<div class="pipe-metrics">
+      <div class="pipe-metrics-title">Pipeline Metrics &amp; Insights</div>
+      <div class="pipe-metrics-grid">
+        <div class="pipe-metric"><div class="pipe-metric-value">${ps.length}</div><div class="pipe-metric-label">Prompts</div></div>
+        <div class="pipe-metric"><div class="pipe-metric-value">${fs.length}</div><div class="pipe-metric-label">Frames</div></div>
+        <div class="pipe-metric"><div class="pipe-metric-value">${savedF}</div><div class="pipe-metric-label">Saved</div></div>
+        <div class="pipe-metric"><div class="pipe-metric-value">${failedF}</div><div class="pipe-metric-label">Failed</div></div>
+      </div>
+      <div class="pipe-bars" style="padding-bottom:18px">${bars}</div>
+    </div>`;
+  }
+
+  function renderChat(d) {
+    const msgs = pipelineChats[d.id] || [];
+    if (!msgs.length) return '';
+    return `<div class="pipe-chat">
+      <div class="pipe-chat-title">Conversation</div>
+      ${msgs.map(m => `
+        <div class="pipe-msg ${m.role}">
+          <div class="pipe-msg-label">${m.role === 'user' ? 'You' : 'LOTUS'} · ${m.time}</div>
+          <div>${escapeHtml(m.text)}</div>
+        </div>`).join('')}
+    </div>`;
+  }
+
+  function fmtRuntime(ms) {
+    const s = Math.floor(ms/1000);
+    const mm = String(Math.floor(s/60)).padStart(2,'0');
+    const ss = String(s%60).padStart(2,'0');
+    return `${mm}:${ss}`;
+  }
+
+  function renderDAG(d) {
+    const activeIdx = PIPELINE_STAGES.findIndex(s => s.key === d.stage);
+    const isDone = d.stage === 'done';
+    const start = pipelineStartTimes[d.id] || Date.now();
+    const runtime = fmtRuntime(Date.now() - start);
+    const statusCls = isDone ? 'done' : (d.stage === 'ask_location' ? 'idle' : 'running');
+    const statusTxt = isDone ? 'Passed' : (d.stage === 'ask_location' ? 'Idle' : 'Running');
+
+    const cards = PIPELINE_STAGES.map((s, i) => {
+      const cls = i === activeIdx ? 'active' : (i < activeIdx || isDone ? 'done' : '');
+      return renderDagCard(s.key, s.label, cls, d);
+    }).join('');
+
+    const procBanner = d.processing
+      ? `<div class="live-proc">
+           <span class="live-proc-dot"></span>
+           <span class="live-proc-text">${escapeHtml(d.processing_label || 'Processing…')}</span>
+         </div>`
+      : '';
+    const errBanner = d.error
+      ? `<div class="err-banner">⚠ ${escapeHtml(d.error)}</div>`
+      : '';
+    return `
+      <div class="dag-header">
+        <span class="dag-runtime" id="dagRuntime-${d.id}">${runtime}</span>
+        <span>${escapeHtml(d.name || 'LOTUS Content Pipeline')}</span>
+        <span class="dag-status ${statusCls}">${statusTxt}</span>
+      </div>
+      ${procBanner}
+      ${errBanner}
+      <div class="dag-scene">
+        <div class="dag">
+          <svg class="dag-svg" id="dagSvg-${d.id}"></svg>
+          <div class="dag-wrap" id="dagWrap-${d.id}">${cards}</div>
+        </div>
+      </div>`;
+  }
+
+  function renderDagCard(key, label, cls, d) {
+    let body = '';
+    if (key === 'ask_location') {
+      const path = d.source_md ? d.source_md.split('/').pop() : '(none)';
+      const icoCls = d.stage === 'ask_location' ? 'pending' : 'done';
+      const ico = d.stage === 'ask_location' ? '…' : '✓';
+      body = `<div class="dag-step"><span class="t">file</span>
+              <span class="lbl">${escapeHtml(path)}</span>
+              <span class="ico ${icoCls}">${ico}</span></div>`;
+    } else if (key === 'review_prompts') {
+      const ps = d.prompts || [];
+      const approved = ps.filter(p => p.status === 'approved').length;
+      const denied = ps.filter(p => p.status === 'denied').length;
+      const pending = ps.filter(p => p.status === 'pending').length;
+      body = ps.slice(0, 4).map((p, i) => {
+        const st = p.status === 'approved' ? 'done'
+                 : p.status === 'denied' ? 'denied' : 'pending';
+        const ic = st === 'done' ? '✓' : st === 'denied' ? '✗' : '○';
+        const stepCls = p.status === 'denied' ? 'denied' : '';
+        return `<div class="dag-step ${stepCls}">
+                  <span class="t">${String(i+1).padStart(2,'0')}</span>
+                  <span class="lbl">${escapeHtml(p.text.slice(0, 36))}${p.text.length>36?'…':''}</span>
+                  <span class="ico ${st}">${ic}</span>
+                </div>`;
+      }).join('');
+      if (ps.length > 4) body += `<div class="dag-step muted"><span class="t"></span><span class="lbl">+${ps.length-4} more</span></div>`;
+      body += `<div class="dag-card-counts">✓ ${approved} · ✗ ${denied} · ○ ${pending}</div>`;
+    } else if (key === 'generating') {
+      const fs = d.frames || [];
+      if (!fs.length) {
+        body = '<div class="dag-step muted"><span class="t"></span><span class="lbl">queued</span><span class="ico pending">○</span></div>';
+      } else {
+        body = fs.slice(0, 5).map((f, i) => {
+          const ic = f.status === 'pending_review' || f.status === 'approved' ? 'done'
+                   : f.status === 'generating' ? 'run'
+                   : f.status === 'failed' ? 'fail' : 'pending';
+          const glyph = ic === 'done' ? '✓' : ic === 'fail' ? '!' : ic === 'run' ? '' : '○';
+          return `<div class="dag-step">
+                    <span class="t">F${i+1}</span>
+                    <span class="lbl">${escapeHtml(f.prompt_text.slice(0, 30))}${f.prompt_text.length>30?'…':''}</span>
+                    <span class="ico ${ic}">${glyph}</span>
+                  </div>`;
+        }).join('');
+        if (fs.length > 5) body += `<div class="dag-step muted"><span class="t"></span><span class="lbl">+${fs.length-5} more</span></div>`;
+      }
+    } else if (key === 'review_frames') {
+      const fs = d.frames || [];
+      const approved = fs.filter(f => f.status === 'approved').length;
+      const pending = fs.filter(f => f.status === 'pending_review').length;
+      const denied = fs.filter(f => f.status === 'denied').length;
+      body = `<div class="dag-step"><span class="t">✓</span><span class="lbl">Approved</span><span class="ico done">${approved}</span></div>
+              <div class="dag-step"><span class="t">○</span><span class="lbl">Pending</span><span class="ico pending">${pending}</span></div>
+              <div class="dag-step"><span class="t">✗</span><span class="lbl">Denied</span><span class="ico denied">${denied}</span></div>`;
+    } else if (key === 'save') {
+      const section = d.save_section || '(not chosen)';
+      body = `<div class="dag-step"><span class="t">dest</span>
+              <span class="lbl">${escapeHtml(section)}</span>
+              <span class="ico ${d.save_section ? 'done' : 'pending'}">${d.save_section ? '✓' : '○'}</span></div>`;
+    } else if (key === 'done') {
+      const saved = (d.frames || []).filter(f => f.final_url).length;
+      body = `<div class="dag-step"><span class="t">saved</span>
+              <span class="lbl">${saved} file${saved === 1 ? '' : 's'}</span>
+              <span class="ico ${saved>0?'done':'pending'}">${saved>0?'✓':'○'}</span></div>`;
+    }
+    // Icon + colour + description per stage (matches reference aesthetic)
+    const stageMeta = {
+      ask_location:   { icon: '📄', color: 'cyan',   title: 'Source',
+                        desc: 'Pick the markdown file with your NB2 prompts.' },
+      review_prompts: { icon: '📝', color: 'amber',  title: 'Prompts',
+                        desc: 'Gemma parses prompts and auto-approves.' },
+      generating:     { icon: '⚙',  color: 'violet', title: 'Generate',
+                        desc: 'Gemini produces each frame from its prompt.' },
+      review_frames:  { icon: '🖼', color: 'violet', title: 'Review Frames',
+                        desc: 'Approve, deny, or regenerate each image.' },
+      save:           { icon: '💾', color: 'accent', title: 'Save',
+                        desc: 'Drop approved frames into the destination folder.' },
+      done:           { icon: '✓',  color: 'green',  title: 'Complete',
+                        desc: 'All frames saved with the correct hierarchy.' },
+    };
+    const meta = stageMeta[key] || { icon: '•', color: 'violet', title: label, desc: '' };
+    const pillCls = cls === 'active' ? 'active' : (cls === 'done' ? 'done' : 'pending');
+    const pillTxt = pillCls === 'active' ? 'In Progress'
+                  : pillCls === 'done' ? 'Completed' : 'Pending';
+    const selectedAttr = (selectedStage && selectedStage === key) ? ' selected' : '';
+    // Footer: compact one-line snapshot (first dag-step rendered out as plain text)
+    const footer = body.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60);
+    return `<div class="dag-card ${cls}${selectedAttr}" data-stage="${key}"
+                 onclick="selectStage('${key}')">
+              <div class="dag-node-head">
+                <span class="dag-icon ${meta.color}">${meta.icon}</span>
+                <span class="dag-status-pill ${pillCls}">${pillTxt}</span>
+              </div>
+              <div class="dag-card-title">${meta.title}</div>
+              <div class="dag-card-sub">${meta.desc}</div>
+              ${footer ? `<div class="dag-card-footer">${escapeHtml(footer)}</div>` : ''}
+            </div>`;
+  }
+
+  let selectedStage = null;
+  function selectStage(key) {
+    selectedStage = selectedStage === key ? null : key;
+    if (pipelineState) renderPipeline(pipelineState);
+    // Scroll detail panel into view
+    setTimeout(() => {
+      const d = document.querySelector('.stage-detail');
+      if (d) d.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }, 50);
+  }
+
+  function renderStageDetail(d) {
+    if (!selectedStage) return '';
+    const stageMeta = {
+      ask_location:   { icon: '📄', color: 'blue',   title: 'Source' },
+      review_prompts: { icon: '📝', color: 'orange', title: 'Prompts' },
+      generating:     { icon: '⚙',  color: 'violet', title: 'Generate' },
+      review_frames:  { icon: '🖼', color: 'violet', title: 'Review Frames' },
+      save:           { icon: '💾', color: 'green',  title: 'Save' },
+      done:           { icon: '✓',  color: 'green',  title: 'Done' },
+    };
+    const meta = stageMeta[selectedStage] || {icon:'•', color:'violet', title: selectedStage};
+
+    let content = '';
+    if (selectedStage === 'ask_location') {
+      content = `<div style="color:var(--p-text-dim);font-size:13px">
+                   <div><strong style="color:var(--p-text)">File:</strong> ${escapeHtml(d.source_md || '(not set)')}</div>
+                 </div>`;
+    } else if (selectedStage === 'review_prompts') {
+      const ps = d.prompts || [];
+      content = `<div style="color:var(--p-text-dim);font-size:13px;margin-bottom:10px">
+                   ${ps.length} prompt(s) · ${ps.filter(p=>p.status==='approved').length} approved
+                 </div>
+                 <div style="max-height:260px;overflow:auto">
+                   ${ps.map((p,i) => `
+                     <div style="padding:8px 0;border-bottom:1px solid var(--p-border);font-size:12px;line-height:1.5">
+                       <span style="color:var(--p-accent);font-weight:600">${i+1}.</span>
+                       ${escapeHtml(p.text.slice(0, 140))}${p.text.length>140?'…':''}
+                     </div>`).join('')}
+                 </div>`;
+    } else if (selectedStage === 'generating' || selectedStage === 'review_frames') {
+      const fs = d.frames || [];
+      const stuck = fs.filter(f => f.status === 'generating').map(f => f.prompt_text.slice(0, 80));
+      content = `<div style="color:var(--p-text-dim);font-size:13px;margin-bottom:10px">
+                   ${fs.length} frame(s) · ${fs.filter(f=>f.status==='pending_review'||f.status==='approved').length} ready
+                 </div>
+                 ${stuck.length ? `<div style="color:var(--p-orange);font-size:12px;margin-bottom:8px">
+                   <strong>Currently generating:</strong> ${escapeHtml(stuck[0])}…
+                 </div>` : ''}
+                 <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px">
+                   ${fs.map((f,i) => {
+                     const thumb = f.temp_url || f.final_url;
+                     return `<div style="background:var(--p-canvas);border:1px solid var(--p-border);border-radius:8px;padding:8px;font-size:11px;color:var(--p-text-dim)">
+                       ${thumb ? `<img src="${thumb}" style="width:100%;aspect-ratio:1;object-fit:cover;border-radius:4px;margin-bottom:6px" />`
+                              : `<div style="width:100%;aspect-ratio:1;background:rgba(255,255,255,0.03);border-radius:4px;margin-bottom:6px;display:flex;align-items:center;justify-content:center">${f.status==='generating'?'⚙':'·'}</div>`}
+                       Frame ${i+1} · ${f.status}
+                     </div>`;
+                   }).join('')}
+                 </div>`;
+    } else if (selectedStage === 'save') {
+      const approved = (d.frames||[]).filter(f => f.status === 'approved');
+      content = `<div style="color:var(--p-text-dim);font-size:13px">
+                   Ready to save ${approved.length} approved frame(s) to a section.
+                 </div>`;
+    } else if (selectedStage === 'done') {
+      const saved = (d.frames||[]).filter(f => f.final_url);
+      content = `<div style="color:var(--p-green);font-size:14px;font-weight:600;margin-bottom:8px">
+                   ✓ ${saved.length} file(s) saved to disk
+                 </div>`;
+    }
+    return `<div class="stage-detail">
+              <div class="stage-detail-header">
+                <span class="stage-detail-icon dag-icon ${meta.color}">${meta.icon}</span>
+                <div>
+                  <div class="stage-detail-title">${meta.title}</div>
+                  <div class="stage-detail-sub">Stage details · click card again to close</div>
+                </div>
+              </div>
+              ${content}
+            </div>`;
+  }
+
+  function drawConnectors() {
+    if (!pipelineState) return;
+    const wrap = document.getElementById(`dagWrap-${pipelineState.id}`);
+    const svg = document.getElementById(`dagSvg-${pipelineState.id}`);
+    if (!wrap || !svg) return;
+    const cards = wrap.querySelectorAll('.dag-card');
+    if (cards.length < 2) return;
+    const wrapRect = wrap.getBoundingClientRect();
+    svg.setAttribute('viewBox', `0 0 ${wrapRect.width} ${wrapRect.height}`);
+    svg.setAttribute('width', wrapRect.width);
+    svg.setAttribute('height', wrapRect.height);
+
+    const activeIdx = PIPELINE_STAGES.findIndex(s => s.key === pipelineState.stage);
+    const allDone = pipelineState.stage === 'done';
+
+    // SVG defs: bigger, higher-contrast arrow markers
+    let defs = `
+      <defs>
+        <marker id="arr-done-${pipelineState.id}" viewBox="0 0 12 12" refX="10" refY="6"
+                markerWidth="10" markerHeight="10" orient="auto">
+          <path d="M0,0 L12,6 L0,12 z" fill="#10b981"/>
+        </marker>
+        <marker id="arr-active-${pipelineState.id}" viewBox="0 0 12 12" refX="10" refY="6"
+                markerWidth="11" markerHeight="11" orient="auto">
+          <path d="M0,0 L12,6 L0,12 z" fill="#ff6b35"/>
+        </marker>
+        <marker id="arr-pending-${pipelineState.id}" viewBox="0 0 12 12" refX="10" refY="6"
+                markerWidth="9" markerHeight="9" orient="auto">
+          <path d="M0,0 L12,6 L0,12 z" fill="#2a3854"/>
+        </marker>
+      </defs>`;
+
+    let paths = '';
+    let glides = '';
+    for (let i = 0; i < cards.length - 1; i++) {
+      const a = cards[i].getBoundingClientRect();
+      const b = cards[i+1].getBoundingClientRect();
+      const x1 = a.right - wrapRect.left;
+      const y1 = a.top - wrapRect.top + a.height / 2;
+      const x2 = b.left - wrapRect.left - 6;   // leave room for arrowhead
+      const y2 = b.top - wrapRect.top + b.height / 2;
+      const midX = (x1 + x2) / 2;
+      const d = `M ${x1} ${y1} C ${midX} ${y1}, ${midX} ${y2}, ${x2} ${y2}`;
+
+      const done = i < activeIdx || allDone;
+      const active = i === activeIdx - 1 && !allDone;
+      const state = done ? 'done' : active ? 'active' : 'pending';
+      const marker = `url(#arr-${state}-${pipelineState.id})`;
+      const pathId = `wire-${pipelineState.id}-${i}`;
+      paths += `<path id="${pathId}" class="wire ${state}" d="${d}" marker-end="${marker}"/>`;
+
+      // On active wire, add a glowing dot that glides end-to-end on a loop
+      if (active) {
+        glides += `
+          <circle r="4" fill="#ffae80" filter="url(#glow)">
+            <animateMotion dur="1.4s" repeatCount="indefinite">
+              <mpath href="#${pathId}"/>
+            </animateMotion>
+          </circle>`;
+      }
+    }
+    const glowFilter = `
+      <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+        <feGaussianBlur in="SourceGraphic" stdDeviation="3"/>
+        <feComposite in="SourceGraphic" in2="blurred"/>
+      </filter>`;
+    svg.innerHTML = defs + glowFilter + paths + glides;
+  }
+  window.addEventListener('resize', drawConnectors);
+
+  function renderActions(d) {
+    let body = '';
+    let title = '';
+    if (d.stage === 'ask_location') {
+      title = 'Select prompts file';
+      body = renderAskLocation(d);
+    } else if (d.stage === 'review_prompts') {
+      title = 'Review prompts';
+      body = renderPromptsReview(d);
+    } else if (d.stage === 'review_frames') {
+      title = 'Review generated frames';
+      body = renderFramesReview(d);
+    } else if (d.stage === 'save') {
+      title = 'Pick destination';
+      body = renderSave(d);
+    } else if (d.stage === 'done') {
+      title = 'Complete';
+      body = renderDone(d);
+    } else if (d.stage === 'generating') {
+      title = 'Generating (live)';
+      body = renderGenerating(d);
+    }
+    if (!body) return '';
+    return `<div class="dag-actions">
+              <div class="dag-actions-title">${title}</div>
+              ${body}
+            </div>`;
+  }
+
+  // Tick the runtime clock for every active pipeline tab
+  setInterval(() => {
+    for (const pid of Object.keys(pipelineStartTimes)) {
+      const el = document.getElementById(`dagRuntime-${pid}`);
+      if (el) el.textContent = fmtRuntime(Date.now() - pipelineStartTimes[pid]);
+    }
+  }, 1000);
+
+  function renderAskLocation(d) {
+    const suggested = d.source_md || '';
+    const hasNativePicker = !!(window.lotus && window.lotus.pickFile);
+    return `
+      <div style="color:var(--text-dim);font-size:13px;margin-bottom:14px">
+        Where is the prompts file? (Claude-generated NB2 .md)
+      </div>
+      <div class="save-row" style="gap:10px">
+        <label style="color:var(--text-dim);font-size:11px;letter-spacing:2px;min-width:70px">PATH:</label>
+        <input id="pipeSource" type="text" value="${escapeAttr(suggested)}"
+               style="flex:1" placeholder="~/LotusAgent/Projects/<parent>/prompts.md" />
+        ${hasNativePicker ? '<button class="p-btn" onclick="pipeBrowse()">BROWSE…</button>' : ''}
+        <button class="p-btn primary" onclick="pipeSetSource()">LOAD →</button>
+      </div>
+      <div style="margin-top:14px;color:var(--text-dim);font-size:11px">
+        ${hasNativePicker
+          ? 'Click BROWSE to open the macOS file picker, or type/paste a path.'
+          : 'Type or paste the full path. (Native picker only available in the desktop app.)'}
+      </div>`;
+  }
+
+  async function pipeBrowse() {
+    if (!window.lotus || !window.lotus.pickFile) return;
+    const res = await window.lotus.pickFile({
+      title: 'Select prompts .md file',
+      defaultPath: document.getElementById('pipeSource').value || undefined,
+    });
+    if (res && res.ok && res.path) {
+      document.getElementById('pipeSource').value = res.path;
+    }
+  }
+
+  function renderPromptsReview(d) {
+    const approvedCount = d.prompts.filter(p => p.status === 'approved').length;
+    const pendingCount  = d.prompts.filter(p => p.status === 'pending').length;
+    const cards = d.prompts.map((p, i) => {
+      return `<div class="p-card ${p.status}">
+        <div class="p-num">${i+1}</div>
+        <div class="p-text">${escapeHtml(p.text)}</div>
+        <div class="p-status">${p.status}</div>
+        <div class="p-btns">
+          <button class="p-btn approve" onclick="pipeApprove('${p.id}')">✓</button>
+          <button class="p-btn deny"    onclick="pipeDeny('${p.id}')">✗</button>
+        </div>
+      </div>`;
+    }).join('');
+    return `
+      <div style="color:var(--text-dim);font-size:12px;margin-bottom:10px">
+        ${d.prompts.length} prompts — ${approvedCount} approved, ${pendingCount} pending
+      </div>
+      <div class="card-list">${cards}</div>
+      <div class="toolbar">
+        <button class="p-btn" onclick="pipeApproveAll()">APPROVE ALL</button>
+        <button class="p-btn primary" onclick="pipeStartGen()" ${approvedCount === 0 ? 'disabled' : ''}>
+          START GENERATION →
+        </button>
+      </div>`;
+  }
+
+  function renderGenerating(d) {
+    const cards = d.frames.map((f, i) => {
+      const isGen = f.status === 'generating';
+      const img = f.temp_url
+        ? `<img src="${f.temp_url}" alt="${escapeAttr(f.prompt_text)}" />`
+        : (isGen ? '<div class="f-spinner"><span class="spinner"></span> GENERATING…</div>'
+                 : '<div class="f-spinner">QUEUED</div>');
+      return `<div class="f-card ${f.status}">
+        <div class="f-thumb">${img}</div>
+        <div class="f-meta">
+          <div class="num">FRAME ${i+1} · ${f.status.toUpperCase()}</div>
+          <div class="prompt">${escapeHtml(f.prompt_text)}</div>
+        </div>
+      </div>`;
+    }).join('');
+    return `
+      <div style="color:var(--amber);font-size:12px;margin-bottom:10px">
+        <span class="spinner"></span> Generating ${d.frames.length} frame${d.frames.length === 1 ? '' : 's'}…
+      </div>
+      <div class="frame-grid">${cards}</div>`;
+  }
+
+  function renderFramesReview(d) {
+    const cards = d.frames.map((f, i) => {
+      const img = f.temp_url
+        ? `<img src="${f.temp_url}" onclick="openLightbox('${f.temp_url}', '${escapeAttr(f.prompt_text)}')" alt="" />`
+        : '<div class="f-spinner">FAILED</div>';
+      const btns = f.status === 'approved'
+        ? '<div style="flex:1;text-align:center;color:var(--green);font-size:11px;letter-spacing:2px;padding:6px;">APPROVED ✓</div>'
+        : f.status === 'denied'
+          ? `<button class="p-btn" onclick="pipeRegen('${f.id}')" style="flex:1">↻ REGEN</button>`
+          : `<button class="p-btn approve" onclick="pipeApproveFrame('${f.id}')" style="flex:1">✓</button>
+             <button class="p-btn" onclick="pipeRegen('${f.id}')" style="flex:1">↻</button>
+             <button class="p-btn deny" onclick="pipeDenyFrame('${f.id}')" style="flex:1">✗</button>`;
+      return `<div class="f-card ${f.status}">
+        <div class="f-thumb">${img}</div>
+        <div class="f-meta">
+          <div class="num">FRAME ${i+1} · ${f.status.toUpperCase()}</div>
+          <div class="prompt">${escapeHtml(f.prompt_text)}</div>
+        </div>
+        <div class="f-actions">${btns}</div>
+      </div>`;
+    }).join('');
+    const approvedCount = d.frames.filter(f => f.status === 'approved').length;
+    return `
+      <div style="color:var(--text-dim);font-size:12px;margin-bottom:10px">
+        Approve each image, regenerate any that aren't right.
+        ${approvedCount} / ${d.frames.length} approved
+      </div>
+      <div class="frame-grid">${cards}</div>`;
+  }
+
+  function renderSave(d) {
+    const approved = d.frames.filter(f => f.status === 'approved');
+    const sections = [
+      'Post1','Post2','Post3','Post4','Post5',
+      'Reel','ReelCover','Story1','Story2','Story3',
+    ];
+    return `
+      <div style="color:var(--text-dim);font-size:12px;margin-bottom:10px">
+        ${approved.length} approved frames ready. Pick destination:
+      </div>
+      <div class="save-row">
+        <label style="color:var(--text-dim);font-size:11px;letter-spacing:2px">SECTION:</label>
+        <select id="saveSection">
+          ${sections.map(s => `<option value="${s}">${s}</option>`).join('')}
+        </select>
+        <button class="p-btn primary" onclick="pipeSave()">SAVE HERE →</button>
+      </div>
+      <div style="margin-top:14px" class="frame-grid">
+        ${approved.map((f, i) => `
+          <div class="f-card approved">
+            <div class="f-thumb"><img src="${f.temp_url}" /></div>
+            <div class="f-meta"><div class="num">FRAME ${i+1}</div></div>
+          </div>`).join('')}
+      </div>`;
+  }
+
+  function renderDone(d) {
+    const saved = d.frames.filter(f => f.final_url);
+    const parent = d.folder || '';
+    const section = d.save_section || '';
+    const tree = [
+      `<span class="b">${escapeHtml(parent)}/</span>`,
+      `&nbsp;&nbsp;└─ <span class="b">${escapeHtml(section)}/</span>`,
+      ...saved.map(f => `&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;├─ ${escapeHtml(f.final_path ? f.final_path.split('/').pop() : 'frame')}`),
+    ].join('<br>');
+    return `
+      <div class="done-burst">
+        <div class="done-check">✓</div>
+        <div style="color:var(--green);font-size:14px;letter-spacing:2px;
+                    margin-top:10px;font-family:Orbitron;text-transform:uppercase">
+          Pipeline Complete
+        </div>
+        <div style="color:var(--text-dim);font-size:12px;margin-top:4px">
+          ${saved.length} frame${saved.length === 1 ? '' : 's'} saved
+        </div>
+      </div>
+      <div class="tree" style="margin-top:14px">${tree}</div>
+      <div style="margin-top:14px" class="frame-grid">
+        ${saved.map(f => `
+          <div class="f-card approved">
+            <div class="f-thumb"><img src="${f.final_url}" onclick="openLightbox('${f.final_url}', '')" /></div>
+            <div class="f-meta"><div class="num">${escapeHtml(f.final_path ? f.final_path.split('/').pop() : '')}</div></div>
+          </div>`).join('')}
+      </div>`;
+  }
+
+  // Legacy no-ops — kept for any stale references; pipeline is tabbed now.
+  function closePipeline() {}
+  function openPipelineTab() {}
+
+  function pipeSend(type, extra) {
+    if (!ws || ws.readyState !== 1) return;
+    ws.send(JSON.stringify({ type, ...(extra || {}) }));
+  }
+  function pipeApprove(id) { pipeSend('pipeline_approve_prompt', { id }); }
+  function pipeDeny(id) { pipeSend('pipeline_deny_prompt', { id }); }
+  function pipeApproveAll() { pipeSend('pipeline_approve_all_prompts', {}); }
+  function pipeStartGen() { pipeSend('pipeline_start_generation', {}); }
+  function pipeApproveFrame(id) { pipeSend('pipeline_approve_frame', { id }); }
+  function pipeDenyFrame(id) { pipeSend('pipeline_deny_frame', { id }); }
+  function pipeRegen(id) { pipeSend('pipeline_regen_frame', { id }); }
+  function pipeSave() {
+    const section = document.getElementById('saveSection').value;
+    pipeSend('pipeline_save_here', { section });
+  }
+  function pipeSetSource() {
+    const path = document.getElementById('pipeSource').value.trim();
+    if (!path) return;
+    pipeSend('pipeline_set_source', { path });
+  }
+
+  // ── Event handling ─────────────────────────────────
+  function handleEvent(data) {
+    if (firstMessage && data.type !== 'connected') {
+      document.getElementById('feed').innerHTML = '';
+      firstMessage = false;
+    }
+    if (data.type === 'connected') return;
+
+    stats.events++;
+    document.getElementById('msgCount').textContent = stats.events;
+
+    const time = data.timestamp ? new Date(data.timestamp).toLocaleTimeString() : '';
+
+    switch(data.type) {
+      case 'user_command':
+        addFeedItem('user', 'You', data.text, time);
+        stats.cmds++;
+        bumpStat('cardCmds', 'statCmds', stats.cmds);
+        setOp('Processing…', true);
+        // Also mirror into any active pipeline chat
+        if (pipelineState) {
+          pipelineChatAppend(pipelineState.id, 'user', data.text);
+          renderPipeline(pipelineState);
+        }
+        break;
+
+      case 'tool_call':
+        if (data.tool === 'gemini') {
+          const inp = data.input || {};
+          const prompt = inp.prompt || '';
+          const target = inp.target || '';
+          generatingItem = addFeedItem(
+            'generating',
+            'Generating',
+            `<span class="spinner"></span>${escapeHtml(target)} — <em style="opacity:0.8">${escapeHtml(prompt)}</em>`,
+            time, /*raw*/ true
+          );
+          setOp(`Generating ${target}`, true);
+        } else if (data.tool === 'voice_auth') {
+          const inp = data.input || {};
+          const ok = inp.status === 'verified';
+          const conf = (inp.confidence ?? 0).toFixed(2);
+          const user = escapeHtml(inp.user || 'unknown');
+          const icon = ok ? '🔐' : (inp.user === 'locked_out' ? '🔒' : '🚫');
+          const label = ok ? 'Verified' : (inp.user === 'locked_out' ? 'Locked Out' : 'Denied');
+          const cls = ok ? 'result' : 'tool';
+          addFeedItem(
+            cls,
+            'Voiceprint',
+            `<span style="font-size:15px;margin-right:6px">${icon}</span>
+             <strong>${label}</strong> — ${user} · confidence ${conf}`,
+            time, /*raw*/ true
+          );
+        } else {
+          addFeedItem('tool', 'Tool', `${data.tool}(${JSON.stringify(data.input||{}).slice(0,80)})`, time);
+        }
+        break;
+
+      case 'tool_result':
+        if (data.image_url) {
+          // Any tool can attach an image (gemini images, screenshots, etc.)
+          if (generatingItem) { generatingItem.remove(); generatingItem = null; }
+          const labelMap = { gemini: 'Saved', screenshot: 'Screenshot' };
+          const label = labelMap[data.tool] || (data.tool || 'Result');
+          const item = addFeedItem('result', label, escapeHtml(data.result || ''), time, true);
+          const img = document.createElement('img');
+          img.className = 'feed-image';
+          img.src = data.image_url + '?t=' + Date.now();  // cache-bust when same URL is reused
+          img.alt = data.prompt || data.result || '';
+          img.title = img.alt;
+          img.onclick = () => openLightbox(img.src, img.alt);
+          item.appendChild(img);
+          // Only generated content goes into the gallery (not screenshots)
+          if (data.tool === 'gemini') {
+            addToGallery(data.image_url, data.prompt || '', data.result || '');
+            stats.imgs++;
+            bumpStat('cardImgs', 'statImgs', stats.imgs);
+          }
+          setOp('Connected — Idle', false);
+        } else {
+          addFeedItem('result', 'Result', escapeHtml(data.result || ''), time, true);
+        }
+        break;
+
+      case 'agent_response':
+        if (generatingItem) { generatingItem.remove(); generatingItem = null; }
+        typeFeedItem('agent', 'LOTUS', data.text, time);
+        setOp('Connected — Idle', false);
+        if (pipelineState) {
+          pipelineChatAppend(pipelineState.id, 'agent', data.text);
+          renderPipeline(pipelineState);
+        }
+        break;
+    }
+  }
+
+  // ── Feed helpers ───────────────────────────────────
+  function addFeedItem(type, label, htmlOrText, time, raw) {
+    const feed = document.getElementById('feed');
+    const item = document.createElement('div');
+    item.className = `feed-item ${type}`;
+    const body = raw ? htmlOrText : escapeHtml(htmlOrText);
+    item.innerHTML = `
+      <span class="feed-time">${time}</span>
+      <div class="feed-label">${label}</div>
+      <div class="body">${body}</div>
+    `;
+    feed.appendChild(item);
+    feed.scrollTop = feed.scrollHeight;
+    return item;
+  }
+
+  // Agent response with typewriter effect
+  function typeFeedItem(type, label, text, time) {
+    const item = addFeedItem(type, label, '', time, true);
+    const body = item.querySelector('.body');
+    body.classList.add('typing-cursor');
+    let i = 0;
+    const speed = 12; // ms per char
+    const tick = () => {
+      if (i <= text.length) {
+        body.textContent = text.slice(0, i);
+        document.getElementById('feed').scrollTop = 1e9;
+        i++;
+        setTimeout(tick, speed);
+      } else {
+        body.classList.remove('typing-cursor');
+      }
+    };
+    tick();
+  }
+
+  function bumpStat(cardId, valId, value) {
+    document.getElementById(valId).textContent = value;
+    const card = document.getElementById(cardId);
+    card.classList.remove('pulse');
+    void card.offsetWidth;   // restart animation
+    card.classList.add('pulse');
+  }
+
+  // ── Gallery ────────────────────────────────────────
+  function addToGallery(url, prompt, caption) {
+    const gal = document.getElementById('gallery');
+    const empty = gal.querySelector('.gallery-empty');
+    if (empty) empty.remove();
+
+    const item = document.createElement('div');
+    item.className = 'gallery-item';
+    item.innerHTML = `
+      <img src="${url}" alt="${escapeAttr(prompt)}" />
+      <div class="caption">${escapeHtml(caption.replace(/^Saved /,''))}</div>
+    `;
+    item.onclick = () => openLightbox(url, prompt);
+    gal.insertBefore(item, gal.firstChild);
+
+    const count = gal.querySelectorAll('.gallery-item').length;
+    document.getElementById('galleryCount').textContent = count;
+  }
+
+  // ── Lightbox ───────────────────────────────────────
+  function openLightbox(url, caption) {
+    document.getElementById('lightboxImg').src = url;
+    document.getElementById('lightboxCaption').textContent = caption;
+    document.getElementById('lightbox').classList.add('show');
+  }
+  function closeLightbox(e) {
+    if (e && e.target.tagName === 'IMG' && e.target.id === 'lightboxImg') return;
+    document.getElementById('lightbox').classList.remove('show');
+  }
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeLightbox();
+  });
+
+  // ── Status ─────────────────────────────────────────
+  function setOp(text, active) {
+    const el = document.getElementById('opStatus');
+    el.innerHTML = active ? `<span class="dot"></span>${text}` : text;
+    el.classList.toggle('active', !!active);
+    waveActive = !!active;
+  }
+
+  // ── Input ──────────────────────────────────────────
+  function sendCmd() {
+    const input = document.getElementById('cmdInput');
+    const text = input.value.trim();
+    if (!text || !ws || ws.readyState !== 1) return;
+    ws.send(JSON.stringify({ type: 'user_command', text: text }));
+    input.value = '';
+  }
+  document.getElementById('cmdInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') sendCmd();
+  });
+
+  // ── Command chips ──────────────────────────────────
+  document.getElementById('chips').addEventListener('click', (e) => {
+    if (e.target.classList.contains('chip')) {
+      document.getElementById('cmdInput').value = e.target.textContent;
+      document.getElementById('cmdInput').focus();
+    }
+  });
+
+  // ── Escapes ────────────────────────────────────────
+  function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = String(str || '');
+    return div.innerHTML;
+  }
+  function escapeAttr(str) {
+    return String(str || '').replace(/"/g, '&quot;');
+  }
+</script>
+</body>
+</html>

@@ -1,0 +1,110 @@
+@import "@xyflow/react/dist/style.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  font-family: system-ui, -apple-system, 'Helvetica Neue', sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+html, body, #root { height: 100%; margin: 0; background: #05070d; color: #e6ebf5; }
+body { overflow: hidden; }
+
+/* Glass-morphism helpers — override solid theme backgrounds with
+   translucent equivalents so the global animated gradient mesh shows
+   through every surface. Gives the whole app a Linear/Vercel feel
+   across all tabs (Main Dashboard, Pipeline, Gallery). */
+.bg-canvas    { background-color: rgba(10, 15, 28, 0.55) !important; backdrop-filter: blur(14px) saturate(140%); -webkit-backdrop-filter: blur(14px) saturate(140%); }
+.bg-surface   { background-color: rgba(20, 26, 40, 0.60) !important; backdrop-filter: blur(12px) saturate(140%); -webkit-backdrop-filter: blur(12px) saturate(140%); }
+.bg-surface2  { background-color: rgba(26, 33, 52, 0.60) !important; backdrop-filter: blur(12px) saturate(140%); -webkit-backdrop-filter: blur(12px) saturate(140%); }
+
+/* Subtle luminous edges in place of flat dark borders */
+.border-border      { border-color: rgba(255,255,255,0.07) !important; }
+.border-border-soft { border-color: rgba(255,255,255,0.04) !important; }
+
+/* React-Flow panels are heavy inside Pipeline tab — keep them fully
+   opaque so the graph stays legible over the mesh. */
+.react-flow__background,
+.react-flow__controls button,
+.react-flow__minimap { backdrop-filter: none !important; }
+
+/* React Flow dark theme overrides */
+.react-flow__background { background: #0a0f1c !important; }
+.react-flow__edge-path { stroke: #2a3854; stroke-width: 2; }
+.react-flow__edge.done .react-flow__edge-path { stroke: #10b981; stroke-width: 2.5; }
+.react-flow__edge.active .react-flow__edge-path {
+  stroke: #ff6b35;
+  stroke-width: 3;
+  stroke-dasharray: 10 12;
+  animation: wire-flow 0.8s linear infinite;
+  filter: drop-shadow(0 0 8px rgba(255,107,53,0.55));
+}
+.react-flow__arrowhead polygon { fill: #2a3854; }
+.react-flow__edge.done .react-flow__arrowhead polygon { fill: #10b981; }
+.react-flow__edge.active .react-flow__arrowhead polygon { fill: #ff6b35; }
+.react-flow__handle { opacity: 0; pointer-events: none; }
+.react-flow__controls button {
+  background: #141a28 !important; border: 1px solid #232d45 !important;
+  color: #e6ebf5 !important; border-radius: 6px !important;
+}
+.react-flow__minimap {
+  background: #141a28 !important; border: 1px solid #232d45; border-radius: 8px;
+}
+
+@keyframes wire-flow { to { stroke-dashoffset: -22; } }
+
+/* Voice / processing equaliser bars */
+@keyframes lotus-eq {
+  0%, 100% { height: 3px;  opacity: 0.55; }
+  50%      { height: 14px; opacity: 1; }
+}
+
+/* Brain-icon electric-wire halo — dashed ring flows + spark dots orbit */
+@keyframes brainwire-dash {
+  from { stroke-dashoffset: 0; }
+  to   { stroke-dashoffset: -10; }
+}
+@keyframes brainwire-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+/* ── StageNode polish keyframes ───────────────────────────────── */
+@keyframes stagenode-halo {
+  0%   { transform: scale(1);   opacity: 0.7; }
+  70%  { transform: scale(1.4); opacity: 0;   }
+  100% { transform: scale(1.4); opacity: 0;   }
+}
+@keyframes stagenode-icon-pulse {
+  0%, 100% { transform: scale(1);    opacity: 0.9; }
+  50%      { transform: scale(1.08); opacity: 1;   }
+}
+@keyframes stagenode-dot-blink {
+  0%, 100% { opacity: 0.4; transform: scale(0.85); }
+  50%      { opacity: 1;   transform: scale(1.15); }
+}
+@keyframes stagenode-shimmer {
+  from { left: -30%; }
+  to   { left: 100%; }
+}
+@keyframes spin-slow { to { transform: rotate(360deg); } }
+.animate-spin-slow { animation: spin-slow 3s linear infinite; }
+
+/* ── ReactFlow active edge — packets flow left→right ─────────────
+   The dashed stroke already animates (wire-flow). We overlay a small
+   circle that moves along the same path using stroke-dasharray on the
+   *linecap-offset*. The simpler approach: tighter dash + higher speed.
+   True packet dots are added via the PacketEdges overlay component. */
+.react-flow__edge.active .react-flow__edge-path {
+  stroke-width: 2.8 !important;
+  stroke-dasharray: 5 10 !important;
+  filter: drop-shadow(0 0 4px rgba(255,107,53,0.55));
+}
+.react-flow__edge.done .react-flow__edge-path {
+  stroke-width: 2.4 !important;
+  filter: drop-shadow(0 0 3px rgba(16,185,129,0.4));
+}

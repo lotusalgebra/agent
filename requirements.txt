@@ -1,0 +1,36 @@
+# LOTUS Agent — Dependencies
+# Install: pip install -r requirements.txt
+
+# Core
+anthropic>=0.40.0
+
+# Voice
+SpeechRecognition>=3.10.0
+edge-tts>=6.1.0
+openai-whisper>=20231117      # Optional: offline STT (needs ffmpeg)
+# PyAudio install varies by OS:
+#   Windows: pip install pipwin && pipwin install pyaudio
+#   macOS:   brew install portaudio && pip install pyaudio
+#   Linux:   sudo apt install python3-pyaudio
+
+# Screen Control
+pyautogui>=0.9.54
+Pillow>=10.0.0
+pyperclip>=1.8.2
+
+# System Info
+psutil>=5.9.0
+
+# Dashboard
+websockets>=12.0
+
+# Voice Authentication (pick one)
+resemblyzer>=0.1.3            # Lightweight speaker embeddings (recommended)
+# speechbrain>=1.0.0          # Alternative: heavier but more accurate
+
+# OCR (optional but recommended for screen reading)
+# pytesseract>=0.3.10
+# Also install Tesseract engine:
+#   Windows: https://github.com/UB-Mannheim/tesseract/wiki
+#   macOS:   brew install tesseract
+#   Linux:   sudo apt install tesseract-ocr

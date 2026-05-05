@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  productbuild Distribution file — drives the wizard UI of the final
+  .pkg installer. Mirrors the MSI feel: welcome → license → install →
+  finish.
+-->
+<installer-gui-script minSpecVersion="2">
+    <title>LOTUS Agent Child</title>
+    <organization>com.lotusalgebra</organization>
+    <domains enable_localSystem="true"/>
+
+    <!-- Visible text at each step of the installer wizard.
+         Files are referenced RELATIVELY to this Distribution.xml when
+         productbuild is invoked with --resources . -->
+    <welcome file="welcome.html"   mime-type="text/html"/>
+    <license file="license.txt"    mime-type="text/plain"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+
+    <!-- Minimum macOS. Same minimum that homebrew-installed Python 3.10
+         supports cleanly. -->
+    <options customize="never" allow-external-scripts="no" require-scripts="no"/>
+    <os-version min="11.0"/>
+
+    <!-- Choices + pkg-ref plumbing. One choice = one feature. "Complete"
+         is all we ship; no user-facing decomposition needed for now. -->
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.lotusalgebra.lotus-child"/>
+        </line>
+    </choices-outline>
+
+    <choice id="default"/>
+    <choice id="com.lotusalgebra.lotus-child" visible="false">
+        <pkg-ref id="com.lotusalgebra.lotus-child"/>
+    </choice>
+
+    <!-- File produced by pkgbuild, linked here by productbuild. -->
+    <pkg-ref id="com.lotusalgebra.lotus-child"
+             version="1.0.0"
+             onConclusion="none">lotus-child-component.pkg</pkg-ref>
+</installer-gui-script>

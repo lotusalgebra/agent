@@ -1,0 +1,57 @@
+{
+  "name": "lotus-desktop",
+  "version": "0.1.0",
+  "description": "LOTUS Agent desktop client — controls the LOTUS mother over LAN.",
+  "main": "main.js",
+  "author": "Somendra / Lotus Algebra",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "build:mac": "electron-builder --mac",
+    "build:win": "electron-builder --win",
+    "build:linux": "electron-builder --linux"
+  },
+  "devDependencies": {
+    "electron": "^32.0.0",
+    "electron-builder": "^25.0.0"
+  },
+  "build": {
+    "appId": "com.lotusalgebra.lotus-agent",
+    "productName": "LOTUS Agent",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "setup.html",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../dist/lotus-mother",
+        "to": "lotus-mother",
+        "filter": ["**/*"]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": "dmg",
+      "icon": "icon.icns",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "LOTUS Agent uses your microphone to listen for the wake word and to verify your voiceprint before accepting commands.",
+        "NSCameraUsageDescription": "LOTUS Agent does not use the camera; this entry is reserved for future video features."
+      }
+    },
+    "win": {
+      "target": "nsis",
+      "icon": "icon.ico"
+    },
+    "linux": {
+      "target": "AppImage",
+      "category": "Utility",
+      "icon": "icon.png"
+    }
+  }
+}

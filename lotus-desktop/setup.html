@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>LOTUS Agent — Connect</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600&family=Orbitron:wght@400;700;900&display=swap');
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background:
+      radial-gradient(800px 600px at 20% 10%, rgba(255,107,53,0.08), transparent 60%),
+      radial-gradient(600px 500px at 90% 90%, rgba(0,229,255,0.07), transparent 55%),
+      #050810;
+    color: #dbe3f0;
+    font-family: 'JetBrains Mono', monospace;
+    padding: 28px 32px;
+    display: flex; flex-direction: column; gap: 18px;
+  }
+  .logo {
+    font-family: 'Orbitron', sans-serif;
+    font-weight: 900; font-size: 22px; letter-spacing: 6px;
+    background: linear-gradient(135deg, #ff6b35, #00e5ff);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .subtitle { color: #8892a8; font-size: 11px; letter-spacing: 2px; text-transform: uppercase; }
+  label { font-size: 11px; color: #8892a8; letter-spacing: 1.5px; text-transform: uppercase; display: block; margin-bottom: 6px; }
+  input {
+    width: 100%;
+    background: #111826;
+    border: 1px solid #1e2a42;
+    border-radius: 6px;
+    padding: 10px 14px;
+    color: #dbe3f0;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    outline: none;
+  }
+  input:focus { border-color: #ff6b35; }
+  .row { display: flex; flex-direction: column; gap: 6px; }
+  .row.inline { flex-direction: row; gap: 8px; align-items: end; }
+  .row.inline > div { flex: 1; }
+  .hint { color: #4a5568; font-size: 10px; letter-spacing: 1px; margin-top: 4px; }
+  button {
+    margin-top: 6px;
+    background: linear-gradient(135deg, #ff6b35, #e95a28);
+    border: none;
+    border-radius: 6px;
+    padding: 12px;
+    color: white;
+    font-family: 'Orbitron', sans-serif;
+    font-size: 12px;
+    letter-spacing: 3px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: transform 0.15s ease, box-shadow 0.2s ease;
+  }
+  button:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(255,107,53,0.35); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+  .err { color: #ef4444; font-size: 11px; letter-spacing: 1px; min-height: 14px; }
+</style>
+</head>
+<body>
+  <div>
+    <div class="logo">LOTUS</div>
+    <div class="subtitle">Connect to the mother system</div>
+  </div>
+
+  <div class="row inline">
+    <div>
+      <label for="host">Server host / IP</label>
+      <input id="host" type="text" placeholder="192.168.1.42 or lotus.local" autofocus />
+      <div class="hint">Use the IP of the machine running <code>agent_phase1.py</code></div>
+    </div>
+    <div style="max-width: 100px">
+      <label for="port">Port</label>
+      <input id="port" type="number" value="8766" />
+    </div>
+  </div>
+
+  <div class="row">
+    <label for="token">Auth token</label>
+    <input id="token" type="text" placeholder="paste from mother terminal" spellcheck="false" />
+    <div class="hint">Shown on mother startup; also stored at <code>~/.lotus_auth/token.txt</code></div>
+  </div>
+
+  <div class="err" id="err"></div>
+  <button id="btn">CONNECT</button>
+
+  <script>
+    const $host = document.getElementById('host');
+    const $port = document.getElementById('port');
+    const $token = document.getElementById('token');
+    const $btn = document.getElementById('btn');
+    const $err = document.getElementById('err');
+
+    async function connect() {
+      $err.textContent = '';
+      const serverHost = $host.value.trim();
+      const httpPort = parseInt($port.value, 10) || 8766;
+      const token = $token.value.trim();
+      if (!serverHost || !token) {
+        $err.textContent = 'Host and token are required';
+        return;
+      }
+      $btn.disabled = true;
+      const res = await window.lotus.saveSettings({ serverHost, httpPort, token });
+      if (!res.ok) {
+        $err.textContent = res.error || 'Unknown error';
+        $btn.disabled = false;
+      }
+    }
+    $btn.addEventListener('click', connect);
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') connect();
+    });
+  </script>
+</body>
+</html>

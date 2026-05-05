@@ -1,0 +1,77 @@
+# ── Python ────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# ── Node / JS ─────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ── Build output (regen via `pyinstaller … .spec` and `npm run build*`) ─
+build/
+dist/
+*.app/
+*.dmg
+*.pkg
+*.msi
+*.exe
+
+# ── OS ────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+
+# ── Editor / IDE ──────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*~
+.cursor/
+
+# ── LOTUS runtime data (local + private) ──────────────────────────────
+Projects/
+uploads/
+reports/
+recordings/
+.lotus_screenshots/
+.lotus_auth/
+.lotus/
+vendor/
+
+# ── Databases (runtime state, not source) ─────────────────────────────
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# ── Sensitive — defense-in-depth (none should be in repo, but belt+suspenders) ─
+*token*.txt
+*api_key*.txt
+*.npz
+*.env
+.env*
+
+# ── Test files with hardcoded local paths ─────────────────────────────
+# These reference absolute paths under the original developer's home
+# directory. They won't run on a fresh clone — restored via env vars
+# or fixtures in a future PR.
+tests/test_luxury_mdfile.py
+tests/run_luxury_full.py
+
+# ── Backups ───────────────────────────────────────────────────────────
+*.bak
+*.orig
