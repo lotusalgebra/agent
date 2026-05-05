@@ -1060,6 +1060,9 @@ function StageDetail({ pipeline, selected, config, onAction, onClose, alerts, on
   } | null>(null);
   // Error log panel open/closed (Phase 2: just a collapsible list).
   const [errorsOpen, setErrorsOpen] = useState(false);
+  // Failure-banner expandable resolution-steps panel. Lives in the pipeline
+  // header so it's visible across tabs whenever any frame is in 'failed'.
+  const [showFailureSteps, setShowFailureSteps] = useState(false);
   // Agents strip — collapsible. Defaults open so users see the mesh
   // working without hunting for it.
   const [agentsOpen, setAgentsOpen] = useState(true);
@@ -1658,6 +1661,83 @@ function StageDetail({ pipeline, selected, config, onAction, onClose, alerts, on
               </div>
             )}
             {/* ── end controller alerts ── */}
+            {/* ── Failure banner — appears whenever ANY frame is in 'failed'
+                  status, regardless of pipeline.paused. Non-blocking: the
+                  render loop continues underneath; this banner is purely
+                  informational + actionable. Shows the first 5 failed frame
+                  IDs and expandable resolution steps. Auto-disappears once
+                  the failed count reaches 0 (user retries / uploads / skips
+                  via the per-frame buttons in the review_frames grid). ── */}
+            {(() => {
+              const failedFrames = pipeline.frames.filter(f => f.status === 'failed');
+              if (failedFrames.length === 0) return null;
+              const preview = failedFrames.slice(0, 5).map(f =>
+                `${f.section || '?'}/${f.id}`).join(', ');
+              const more = failedFrames.length > 5
+                ? `, +${failedFrames.length - 5} more` : '';
+              return (
+                <div style={{
+                  marginBottom: 10, padding: '10px 12px', borderRadius: 8,
+                  background: 'rgba(239,68,68,0.10)',
+                  border: '1px solid rgba(239,68,68,0.40)',
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'flex-start',
+                                justifyContent: 'space-between', gap: 12 }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 11, fontWeight: 800, color: '#fca5a5',
+                                    textTransform: 'uppercase', letterSpacing: '0.15em' }}>
+                        ⚠ {failedFrames.length} frame{failedFrames.length === 1 ? '' : 's'} need attention
+                      </div>
+                      <div style={{ fontSize: 11, color: '#e6ebf5', marginTop: 4,
+                                    fontFamily: 'monospace', wordBreak: 'break-word' }}>
+                        {preview}{more}
+                      </div>
+                    </div>
+                    <button onClick={() => setShowFailureSteps(v => !v)}
+                      style={{ padding: '6px 10px', borderRadius: 6, fontSize: 10,
+                               fontWeight: 700, letterSpacing: '0.10em',
+                               textTransform: 'uppercase', cursor: 'pointer',
+                               background: 'rgba(239,68,68,0.15)', color: '#fca5a5',
+                               border: '1px solid rgba(239,68,68,0.40)',
+                               whiteSpace: 'nowrap' }}>
+                      {showFailureSteps ? 'Hide steps' : 'How to fix'}
+                    </button>
+                  </div>
+                  {showFailureSteps && (
+                    <div style={{ marginTop: 10, paddingTop: 10,
+                                  borderTop: '1px dashed rgba(239,68,68,0.30)',
+                                  fontSize: 11, color: '#e6ebf5', lineHeight: 1.55 }}>
+                      <div style={{ fontWeight: 700, color: '#fca5a5', marginBottom: 6 }}>
+                        Per failed frame in the Review Frames grid below, choose one:
+                      </div>
+                      <div style={{ paddingLeft: 4 }}>
+                        <div><strong>↻ Retry</strong> — re-runs the prompt through Gemini.
+                          Best for transient failures (network blip, content-policy false positive).
+                          Gives up after 3 attempts.</div>
+                        <div style={{ marginTop: 4 }}>
+                          <strong>↑ Upload</strong> — generate the image manually
+                          (e.g. open Gemini in a normal tab, paste the prompt,
+                          download with the hover-toolbar Download icon), then click Upload
+                          and select the file.</div>
+                        <div style={{ marginTop: 4 }}>
+                          <strong>⊝ Skip</strong> — mark this slot as intentionally empty.
+                          Use when the prompt itself is unrecoverable (e.g. content
+                          consistently rejected).</div>
+                        <div style={{ marginTop: 4 }}>
+                          <strong>⧉ Copy</strong> — copy the prompt text to clipboard
+                          (handy if you're going to upload manually).</div>
+                      </div>
+                      <div style={{ marginTop: 8, fontStyle: 'italic',
+                                    color: '#9ca3af' }}>
+                        Pipeline keeps generating remaining frames in the
+                        background — no need to resolve everything before
+                        continuing.
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
             {/* ── Phase 2: pause banner + report strip + error log ── */}
             {pipeline.paused && (
               <div style={{
