@@ -4664,6 +4664,34 @@ class LotusPhase1:
                         import time as _time
                         _time.sleep(3.0)
 
+            # Sweep stuck frames. If create_post_burst raised before
+            # processing every frame in `tasks`, those unfinished frames
+            # are still in 'generating' status (the on_done callback only
+            # fires for frames that reached either save-success or a
+            # per-frame fail). Without this sweep they'd stay stuck
+            # forever — the dashboard renders Approve/Deny only for
+            # 'pending_review' and Retry/Skip only for 'failed', so
+            # 'generating' is a dead state at the review stage.
+            stuck = [fr for fr in frames if fr.get("status") == "generating"]
+            if stuck:
+                import time as _time
+                stuck_ts = _time.time()
+                for fr in stuck:
+                    fr["status"] = "failed"
+                    fr["error"]  = (
+                        fr.get("error")
+                        or "Render burst exited before this frame completed"
+                    )
+                    p.errors.append({
+                        "ts":       stuck_ts,
+                        "frame_id": fr.get("id", ""),
+                        "section":  section,
+                        "stage":    "burst",
+                        "message":  "stuck-frame swept to failed (burst aborted)",
+                    })
+                print(f"[pipeline] {section} swept {len(stuck)} stuck frame(s) → failed",
+                      flush=True)
+
             # Post-boundary status. Any frame in THIS post that ended as
             # 'failed' is logged for the dashboard's error feed and the
             # review_frames stage to pick up — but we DO NOT block the
