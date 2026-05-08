@@ -56,10 +56,25 @@ def _resolve_pipeline_choice() -> str:
 
 def _gen_image_chain(primary: str) -> list:
     """Return the engine name list, primary first then the rest in their
-    natural fallback order. Keeps the original ordering for non-primary
-    tiers so behavior matches what users have always seen."""
-    natural = ["playwright", "human", "api"]
+    natural fallback order.
+
+    The 'human' tier (gemini_bot_human.py) drives Chrome via pyautogui +
+    AppleScript + clipboard, which triggers macOS-native save dialogs
+    that pile up over the user's other windows. It is **opt-in only**
+    via explicit `image.pipeline=human` in lotus_config or the
+    LOTUS_GEN_IMAGE_PIPELINE=human env var. We never auto-fall through
+    to it from playwright, because the failure modes that knock out
+    playwright (Gemini content-block, network blip) are not the kind
+    the human bot can solve any better — and the surprise dialog
+    barrage was confusing users about what was happening to their
+    pipeline. If both playwright and api are unavailable, the frame
+    fails and the user retries from the dashboard."""
+    natural = ["playwright", "api"]   # 'human' deliberately excluded
     chain = [primary] + [e for e in natural if e != primary]
+    # If user explicitly picked 'human' as primary, keep it — and let
+    # playwright + api be available as fallbacks for that case.
+    if primary == "human":
+        chain = ["human", "playwright", "api"]
     return chain
 
 
@@ -4629,40 +4644,32 @@ class LotusPhase1:
                     except Exception: pass
                 self._pipeline_broadcast()
 
-            # Burst with one automatic retry on exception. Transient
-            # failures (CDP blip, Chrome window churn, page-navigation
-            # races) frequently succeed on the second attempt. The
-            # _connect_cdp_with_retry helper inside gemini_bot already
-            # absorbs short Chrome restarts; this outer retry covers the
-            # case where the FIRST attempt got far enough to start a
-            # burst but then died mid-flight.
-            burst_attempts = 0
-            while burst_attempts < 2:
-                burst_attempts += 1
+            # Single burst attempt — DO NOT retry the whole post on
+            # exception. Earlier code retried create_post_burst() once,
+            # but that re-sent the ENTIRE prompt list in a fresh Gemini
+            # chat, including slides that succeeded in the first attempt
+            # → user saw "same prompt entered many times". The inner
+            # _connect_cdp_with_retry (5 attempts with exponential
+            # backoff) handles real transient connection issues; if a
+            # mid-burst failure escapes that, the unfinished frames are
+            # marked failed by the stuck-sweep below and the user
+            # resolves them via the per-frame Retry button.
+            try:
+                gemini_bot.create_post_burst(
+                    tasks, verbose=True, on_done=_cb,
+                )
+            except Exception as e:
+                print(f"[pipeline] burst error on {section}: {e}")
                 try:
-                    gemini_bot.create_post_burst(
-                        tasks, verbose=True, on_done=_cb,
-                    )
-                    break
-                except Exception as e:
-                    print(f"[pipeline] burst error on {section} "
-                          f"(attempt {burst_attempts}/2): {e}")
-                    try:
-                        import time as _time
-                        p.errors.append({
-                            "ts":       _time.time(),
-                            "frame_id": "",
-                            "section":  section,
-                            "stage":    "burst",
-                            "message":  f"burst error (attempt {burst_attempts}/2): {e}",
-                        })
-                    except Exception: pass
-                    if burst_attempts < 2:
-                        # Brief wait before retry — gives CDP / Chrome a
-                        # chance to settle if the failure was a transient
-                        # connection blip.
-                        import time as _time
-                        _time.sleep(3.0)
+                    import time as _time
+                    p.errors.append({
+                        "ts":       _time.time(),
+                        "frame_id": "",
+                        "section":  section,
+                        "stage":    "burst",
+                        "message":  f"burst error: {e}",
+                    })
+                except Exception: pass
 
             # Sweep stuck frames. If create_post_burst raised before
             # processing every frame in `tasks`, those unfinished frames
@@ -5371,16 +5378,14 @@ class LotusPhase1:
         print(f"[review] ✗ {frame_id} — {verb}  ({reason})")
         self._pipeline_broadcast()
 
-        # Auto-retry via the existing single-frame retry path, on its own
-        # thread so this watcher can exit cleanly.
-        if retry_n < 3:
-            import threading as _th
-            _th.Thread(
-                target=self._pipeline_frame_retry,
-                args=(frame_id,),
-                daemon=True,
-                name=f"auto-retry-{frame_id}",
-            ).start()
+        # NOTE: auto-retry on review rejection has been DISABLED. Previously
+        # this fired up to 3 _pipeline_frame_retry threads per rejection,
+        # each re-submitting the same prompt to a new Gemini call. Combined
+        # with the burst-level pass and any manual user retries, a single
+        # frame could hit Gemini 5+ times — visible to the user as the
+        # same prompt being entered into Gemini chat repeatedly.
+        # Frame is marked 'failed' with the rejection reason; the user
+        # decides whether to retry, upload, or skip from the dashboard.
 
     def _pipeline_frame_retry(self, frame_id: str) -> None:
         """Re-render a single failed frame via gemini_bot.create_image_and_download.
