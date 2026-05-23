@@ -34,6 +34,13 @@ _GEN_ENGINES = {
     "playwright": ("gemini_bot",       "create_image_and_download"),
     "human":      ("gemini_bot_human", "create_image_and_download"),
     "api":        ("gemini_api",       "create_image_and_download"),
+    # Google Flow (labs.google/fx/tools/flow) — Nano Banana 2 image gen
+    # via Playwright + CDP. Separate quota from the Gemini-chat browser
+    # path; useful when chat is rate-limited or hanging on long prompts.
+    # MVP scope: outputs at Flow's currently-selected aspect (typically
+    # 9:16) — set 9:16 in Flow's UI for Story carousels. Post slides
+    # (4:5 target) should fall through to playwright/api in the chain.
+    "flow":       ("flow_bot",         "create_image_and_download"),
 }
 
 def _resolve_pipeline_choice() -> str:
@@ -75,6 +82,10 @@ def _gen_image_chain(primary: str) -> list:
     # playwright + api be available as fallbacks for that case.
     if primary == "human":
         chain = ["human", "playwright", "api"]
+    # Flow is an alternative-source engine — when picked, keep playwright
+    # + api as fallbacks for aspect mismatches and Flow outages.
+    elif primary == "flow":
+        chain = ["flow", "playwright", "api"]
     return chain
 
 
@@ -4339,24 +4350,24 @@ class LotusPhase1:
 
     @staticmethod
     def _infer_post_slots(prompts: list) -> list:
-        """Given a list of prompt dicts, return a list of (post_index,
+        """Given a list of prompt dicts, return a list of (section_name,
         frame_index) tuples — one per prompt. `frame_index` is the
-        1-based slot inside the post (resets to 1 on every new post),
-        used directly as the FrameN.png filename component.
+        1-based slot inside that section, used as FrameN.png. For
+        SINGLE_ITEM_SLOTS (StoryN, ReelCover) the frame_index is unused
+        downstream — next_frame_path resolves the canonical single-file
+        path — but a stable 1 is returned for shape consistency.
 
-        Strategy for detecting a NEW post (most reliable first):
-          1. TITLE has "SLIDE N" — trust it (markdown H2 header).
-          2. TEXT has "slide counter N / M" near end of prompt.
-          3. Fall back to sequential.
-
-        A new post begins whenever the detected slide-marker `n` drops
-        from the previous (e.g. 10 → 1) or matches 1 after at least one
-        slide has been emitted. Once `post_idx` increments, a per-post
-        counter `frame_idx` resets to 1 — that's what writes to disk.
-        Previously the code used `n` itself as the filename index, which
-        caused Post3 to start at Frame2 when the first prompt of the new
-        post had `n == 2` (typical for files where slide numbering isn't
-        strictly per-post).
+        Routing strategy (first matching pattern wins, per prompt):
+          A. REEL keyframe — TITLE has `ACT M — KEYFRAME M.K` → ("Reel",
+             flat (M-1)*5 + K). Authored REEL packs (5 acts × 5 keyframes)
+             flatten into a single Reel/ folder of 25 frames.
+          B. Story slot — TITLE has `STORY N` → (f"Story{N}", 1). These
+             land as single PNGs in the parent folder (Story1.png, etc.).
+          C. Post slide — TITLE has `SLIDE N` → ("Post{post_idx}",
+             frame_idx). post_idx increments when N drops or hits 1 after
+             a previous emit; frame_idx resets per post. (Legacy path.)
+          D. Text-tail counter or sequential fallback — same Post{N}
+             routing as (C).
         """
         import re as _re
         results: list = []
@@ -4367,12 +4378,26 @@ class LotusPhase1:
             title = (pr.get("title") or "").upper()
             text  = (pr.get("text") or pr.get("prompt_text") or "")
 
+            # A. REEL keyframe (ACT M — KEYFRAME M.K → flat index in Reel/).
+            km = _re.search(r"\bACT\s*(\d+)\b[^|]*?\bKEYFRAME\s*\d+\.(\d+)\b",
+                            title)
+            if km:
+                act_n  = int(km.group(1))
+                kf_n   = int(km.group(2))
+                results.append(("Reel", (act_n - 1) * 5 + kf_n))
+                continue
+
+            # B. Story slot. Match STORY N but not "story sequence" / "stories".
+            sm = _re.search(r"\bSTORY\s*(\d+)\b", title)
+            if sm:
+                results.append((f"Story{int(sm.group(1))}", 1))
+                continue
+
+            # C/D. Post-style slide numbering — the legacy path.
             n = None
-            # 1. Title — most reliable.
             tm = _re.search(r"\bSLIDE\s*(\d+)\b", title)
             if tm:
                 n = int(tm.group(1))
-            # 2. End-of-text slide counter.
             if n is None:
                 tail = text[-600:]
                 cm = _re.search(
@@ -4381,18 +4406,15 @@ class LotusPhase1:
                 )
                 if cm:
                     n = int(cm.group(1))
-            # 3. Fallback.
             if n is None:
                 n = last_n + 1
 
-            # New post: slide number drops from previous (e.g. 10 → 1 or 8 → 2)
-            # OR matches 1 after at least one slide has been emitted.
             if last_n > 0 and n <= last_n:
                 post_idx += 1
-                frame_idx = 0  # reset per-post counter
+                frame_idx = 0
             last_n = n
             frame_idx += 1
-            results.append((post_idx, frame_idx))
+            results.append((f"Post{post_idx}", frame_idx))
         return results
 
     def _pipeline_generate_approved(self) -> None:
@@ -4466,8 +4488,7 @@ class LotusPhase1:
         for i, prompt in enumerate(p.prompts):
             if prompt["status"] != "approved":
                 continue
-            post_idx, slide_idx = slots[i]
-            section = f"Post{post_idx}"
+            section, slide_idx = slots[i]
             try:
                 target_path = lotus_config.next_frame_path(
                     section, slide_idx, parent=pipeline_parent)
@@ -4540,8 +4561,15 @@ class LotusPhase1:
         for fr, tk in zip(batch_frames, batch_tasks):
             post_groups.setdefault(fr["section"], []).append((fr, tk))
 
-        posts_ordered = sorted(post_groups.keys(),
-                               key=lambda k: int(k.replace("Post", "") or 0))
+        # Sort Posts numerically (Post1, Post2, …) first; non-Post sections
+        # (Reel, ReelCover, Story1-3) follow, alphabetically. Previously
+        # the key was `int(k.replace("Post", ""))` which crashed on
+        # anything that wasn't strictly "Post<number>".
+        def _section_sort_key(k: str):
+            if k.startswith("Post") and k[4:].isdigit():
+                return (0, int(k[4:]))
+            return (1, k)
+        posts_ordered = sorted(post_groups.keys(), key=_section_sort_key)
         if not posts_ordered:
             print(f"[pipeline] nothing to render — all {len(pipeline_frames)} "
                   f"frames already on disk")

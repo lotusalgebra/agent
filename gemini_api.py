@@ -286,7 +286,7 @@ def create_image_and_download(prompt: str, save_to: str,
         if not key: break
         tried += 1
         client = genai.Client(api_key=key)
-        model_id = "gemini-2.5-flash-image-preview" if fallback_used else MODEL
+        model_id = "gemini-2.5-flash-image" if fallback_used else MODEL
         if verbose:
             print(f"[gemini-api] try#{tried} model={model_id} key={key[:6]}…{key[-4:]} "
                   f"aspect={aspect} prompt={len(prompt)} chars")
@@ -318,7 +318,7 @@ def create_image_and_download(prompt: str, save_to: str,
                (is_model_access and not fallback_used):
                 if verbose:
                     print(f"[gemini-api]   model {model_id} unavailable on this plan — "
-                          f"falling back to gemini-2.5-flash-image-preview")
+                          f"falling back to gemini-2.5-flash-image")
                 fallback_used = True
                 resp = None
                 continue

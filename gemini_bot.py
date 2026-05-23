@@ -869,14 +869,18 @@ async def _find_image_index_for_prompt(page, prompt_text: str,
     Returns -1 if not found.
     """
     try:
-        # NB2 prompts all share the opening phrase
-        # "Ultra-photorealistic technical engineering cutaway illustration"
-        # (~65 chars) so a short prefix produces ambiguous matches and
-        # slides with the same prefix stomp each other's img_idx. Use 200
-        # chars so we get well past the prompt-body divergence point.
-        needle = (prompt_text or "").strip()[:200]
-        if not needle:
+        # Anchor on the SUFFIX of the prompt, not the prefix. NB2 prompts
+        # share long opening headers (aspect, camera spec, lighting
+        # boilerplate, etc.) — 200 chars of prefix isn't enough to
+        # disambiguate slides in the same carousel, and even 1000 chars
+        # often collides. The BAKED TEXT block at the END of each prompt
+        # carries per-slide unique content (specific headlines, numbers,
+        # captions). Matching on the trailing 200 chars makes the needle
+        # near-globally unique for these prompt templates.
+        text = (prompt_text or "").strip()
+        if not text:
             return -1
+        needle = text[-200:] if len(text) > 200 else text
         idx = await page.evaluate("""
             (needle) => {
                 const n = needle.toLowerCase();
@@ -928,196 +932,242 @@ async def _find_image_index_for_prompt(page, prompt_text: str,
             }
         """, needle)
         if verbose:
-            print(f"[prompt-match] prefix={needle[:40]!r} → img_idx={idx}")
+            print(f"[prompt-match] suffix={needle[-40:]!r} → img_idx={idx}")
         return int(idx) if idx is not None else -1
     except Exception as e:
         if verbose: print(f"[prompt-match] err: {e}")
         return -1
 
 
-async def _enable_thinking_mode(page, verbose: bool = False) -> bool:
-    """Switch Gemini's model-selector to a Thinking / Pro variant so image
-    generations use the higher-quality (slower) pipeline. "Thinking" in
-    Gemini is a MODEL, not a tool chip — user must click the model
-    dropdown (shows current model name) and pick "2.5 Pro" or a similar
-    variant labelled with "Thinking" / "Pro" / "Deep".
+async def _enable_thinking_mode(page, verbose: bool = False,
+                                thinking_level: str = "Extended") -> bool:
+    """Set Gemini's model to 3.1 Pro with the requested thinking level.
 
-    Returns True when we clicked a Thinking/Pro model option.
+    `thinking_level` is "Extended" or "Standard" — matched case-insensitively
+    against the submenu items ("Standard Best for most questions" /
+    "Extended Complex problem solving"). Call sites can downgrade to
+    Standard for long prompts where Extended tends to hang (observed:
+    prompts ≥ ~1800 chars on Extended frequently produce no response).
+
+    UI shape (verified 2026-05-19):
+      • the model/mode button next to the prompt input has
+        aria-label="Open mode picker" and shows the current model name
+        as its textContent ("Flash-Lite", "3.1 Pro", …)
+      • clicking it opens a menu of <gem-menu-item role="menuitem">
+        entries with EMPTY aria-label — match by textContent:
+          - "3.1 Pro Advanced maths and code"   (model)
+          - "Thinking level Extended"           (thinking level)
+        plus other model variants ("3.1 Flash-Lite Fastest answers", …)
+      • the menu closes on each item click, so we reopen between selections
+    Returns True if both selections succeed or were already set; False if
+    the picker can't be opened or either item is missing.
     """
+    wanted_level = (thinking_level or "Extended").strip()
     try:
         await _dismiss_modals(page, verbose=False)
     except Exception: pass
 
-    # Step 1 — open the model-selector dropdown. We identify it as a
-    # visible button whose aria-label or text is a Gemini model name
-    # (contains "Gemini", "Flash", "Pro", "2.0", "2.5"), with aria-haspopup
-    # or an adjacent chevron.
-    try:
-        opened_info = await page.evaluate("""
-            () => {
-                const want = (s) => {
-                    s = (s||'').toLowerCase().trim();
-                    return /\\b(flash|pro|gemini|2\\.\\d|think|model)\\b/.test(s);
-                };
-                const btns = Array.from(document.querySelectorAll(
-                    'button, [role="button"], [role="combobox"]'
-                ));
-                // Prefer buttons that look like mode/model pickers.
-                const scored = btns.map(b => {
-                    const a = (b.getAttribute('aria-label')||'').trim();
-                    const t = (b.textContent||'').trim();
-                    const hp = b.getAttribute('aria-haspopup') || '';
-                    const d = (b.getAttribute('data-test-id')||'').toLowerCase();
-                    let score = 0;
-                    if (hp) score += 2;
-                    if (d.includes('mode') || d.includes('model')) score += 3;
-                    if (want(a) || want(t)) score += 2;
-                    const r = b.getBoundingClientRect();
-                    if (r.width < 1 || r.height < 1) score = -1;
-                    return {b, a, t, score};
-                }).filter(x => x.score > 0).sort((x, y) => y.score - x.score);
-                if (!scored.length) return {opened: false, labels: []};
-                const best = scored[0];
-                best.b.click();
-                return {opened: true, clicked_label: best.a || best.t || '(no label)'};
-            }
-        """)
-    except Exception as e:
-        if verbose: print(f"[bot] thinking-mode dropdown open err: {e}")
-        opened_info = {"opened": False}
+    async def _open_mode_picker() -> bool:
+        try:
+            return bool(await page.evaluate("""
+                () => {
+                    const b = Array.from(document.querySelectorAll('button, [role="button"]'))
+                        .find(e => {
+                            const a = (e.getAttribute('aria-label') || '').toLowerCase().trim();
+                            if (a !== 'open mode picker') return false;
+                            const r = e.getBoundingClientRect();
+                            return r.width > 0 && r.height > 0;
+                        });
+                    if (!b) return false;
+                    b.click();
+                    return true;
+                }
+            """))
+        except Exception as e:
+            if verbose: print(f"[bot] thinking-mode: open picker err: {e}")
+            return False
 
-    if not opened_info or not opened_info.get("opened"):
-        if verbose: print("[bot] thinking-mode: model dropdown not found")
+    async def _pick_menu_item(needle: str) -> dict:
+        """Click the first <gem-menu-item> whose textContent contains
+        `needle` (case-insensitive). Returns {picked, alreadyOn, seen?}."""
+        try:
+            return await page.evaluate("""
+                (needle) => {
+                    needle = needle.toLowerCase();
+                    const items = Array.from(document.querySelectorAll(
+                        '[role="menuitem"], [role="menuitemradio"], gem-menu-item'
+                    ));
+                    const visible = items.filter(e => {
+                        const r = e.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                    });
+                    const target = visible.find(e =>
+                        (e.textContent || '').toLowerCase().includes(needle)
+                    );
+                    if (!target) {
+                        return {
+                            picked: false,
+                            seen: visible.slice(0, 25).map(e =>
+                                (e.textContent || '').trim().slice(0, 60)
+                            ).filter(Boolean),
+                        };
+                    }
+                    const checked = (target.getAttribute('aria-checked') || '').toLowerCase() === 'true';
+                    if (!checked) target.click();
+                    return {picked: true, alreadyOn: checked,
+                            label: (target.textContent || '').trim().slice(0, 80)};
+                }
+            """, needle)
+        except Exception as e:
+            if verbose: print(f"[bot] thinking-mode: pick {needle!r} err: {e}")
+            return {"picked": False}
+
+    # Step 1 — pick model "3.1 Pro".
+    if not await _open_mode_picker():
+        if verbose: print("[bot] thinking-mode: 'Open mode picker' button not found")
+        return False
+    await page.wait_for_timeout(600)
+    model_pick = await _pick_menu_item("3.1 pro")
+    if not model_pick.get("picked"):
+        if verbose:
+            print("[bot] thinking-mode: '3.1 Pro' item not in menu. "
+                  f"Seen: {model_pick.get('seen')}")
+        try: await page.keyboard.press("Escape")
+        except Exception: pass
         return False
     if verbose:
-        print(f"[bot] thinking-mode: opened model dropdown ({opened_info.get('clicked_label')!r})")
+        state = "already on" if model_pick.get("alreadyOn") else "selected"
+        print(f"[bot] thinking-mode: model {state} ({model_pick.get('label')!r})")
+    await page.wait_for_timeout(500)
 
-    await page.wait_for_timeout(700)
+    # Step 2 — set thinking level to Extended. Reopen the picker (menu
+    # closes after the model click). "Thinking level X" is a submenu
+    # trigger (aria-haspopup="true"): X is the *current* level, so the
+    # label changes per model — match by text prefix instead. Clicking
+    # it opens a submenu containing:
+    #   "Standard Best for most questions"
+    #   "Extended Complex problem solving"
+    if not await _open_mode_picker():
+        if verbose: print("[bot] thinking-mode: couldn't reopen picker for thinking level")
+        return False
+    await page.wait_for_timeout(600)
 
-    # Step 2 — within the opened menu, click an option whose label says
-    # "Thinking" or contains "Pro" / "Deep" (but not "Flash").
     try:
-        pick = await page.evaluate("""
+        trigger = await page.evaluate("""
             () => {
-                const items = Array.from(document.querySelectorAll(
-                    '[role="menuitem"], [role="option"], [role="radio"], li button, li'
-                ));
-                const scoreLbl = (s) => {
-                    s = (s||'').toLowerCase();
-                    if (s.includes('flash')) return -10;
-                    let sc = 0;
-                    if (s.includes('think')) sc += 5;
-                    if (s.includes('deep')) sc += 3;
-                    if (s.includes('pro')) sc += 2;
-                    if (s.includes('2.5')) sc += 1;
-                    return sc;
-                };
-                const ranked = items.map(el => {
-                    const a = (el.getAttribute('aria-label')||'');
-                    const t = (el.textContent||'');
-                    const r = el.getBoundingClientRect();
-                    const visible = r.width > 0 && r.height > 0;
-                    return {el, a, t, score: scoreLbl(a + ' ' + t), visible};
-                }).filter(x => x.visible && x.score > 0)
-                  .sort((x, y) => y.score - x.score);
-                if (!ranked.length) {
-                    // Return what we saw so the caller can diagnose.
-                    const seen = items.slice(0, 30).map(el => (
-                        (el.getAttribute('aria-label')||'') ||
-                        (el.textContent||'').trim().slice(0, 40)
-                    ));
-                    return {picked: false, seen};
+                const items = Array.from(document.querySelectorAll('[role="menuitem"], gem-menu-item'))
+                    .filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+                const target = items.find(e =>
+                    (e.textContent || '').toLowerCase().includes('thinking level')
+                );
+                if (!target) {
+                    return {found: false, seen: items.slice(0, 20).map(e =>
+                        (e.textContent || '').trim().slice(0, 60)).filter(Boolean)};
                 }
-                const best = ranked[0];
-                best.el.click();
-                return {picked: true,
-                        label: (best.a || best.t || '').trim().slice(0, 80)};
+                target.dispatchEvent(new MouseEvent('mouseenter', {bubbles: true}));
+                target.dispatchEvent(new MouseEvent('mouseover', {bubbles: true}));
+                target.click();
+                return {found: true,
+                        label: (target.textContent || '').trim().slice(0, 60)};
             }
         """)
     except Exception as e:
-        if verbose: print(f"[bot] thinking-mode menu click err: {e}")
-        pick = {"picked": False}
+        if verbose: print(f"[bot] thinking-mode: open submenu err: {e}")
+        trigger = {"found": False}
 
-    # Dismiss anything still open.
+    if not trigger.get("found"):
+        if verbose:
+            print("[bot] thinking-mode: 'Thinking level …' submenu trigger not found. "
+                  f"Seen: {trigger.get('seen')}")
+        try: await page.keyboard.press("Escape")
+        except Exception: pass
+        return False
+    if verbose:
+        print(f"[bot] thinking-mode: opened submenu via {trigger.get('label')!r}")
+    await page.wait_for_timeout(700)
+
+    # If the current label already matches the wanted level, the submenu
+    # is just confirming the active state — close it and call it done.
+    if wanted_level.lower() in (trigger.get("label") or "").lower():
+        if verbose: print(f"[bot] thinking-mode: thinking level already {wanted_level}")
+        try: await page.keyboard.press("Escape")
+        except Exception: pass
+        try: await page.keyboard.press("Escape")
+        except Exception: pass
+        return True
+
+    try:
+        ext_pick = await page.evaluate("""
+            (wanted) => {
+                const items = Array.from(document.querySelectorAll('[role="menuitem"], gem-menu-item'))
+                    .filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+                // The submenu's "<level> …" item lives to the right of
+                // the parent — pick the rightmost match to avoid the
+                // parent trigger if its label also ends up containing
+                // the same word.
+                const re = new RegExp('^\\\\s*' + wanted.toLowerCase() + '\\\\b', 'i');
+                const matches = items.filter(e => re.test(e.textContent || ''));
+                if (!matches.length) {
+                    return {picked: false, seen: items.slice(0, 25).map(e =>
+                        (e.textContent || '').trim().slice(0, 60)).filter(Boolean)};
+                }
+                matches.sort((a, b) => b.getBoundingClientRect().x - a.getBoundingClientRect().x);
+                const target = matches[0];
+                target.click();
+                return {picked: true,
+                        label: (target.textContent || '').trim().slice(0, 80)};
+            }
+        """, wanted_level)
+    except Exception as e:
+        if verbose: print(f"[bot] thinking-mode: submenu pick err: {e}")
+        ext_pick = {"picked": False}
+
     try: await page.keyboard.press("Escape")
     except Exception: pass
-    await page.wait_for_timeout(400)
+    try: await page.keyboard.press("Escape")
+    except Exception: pass
+    await page.wait_for_timeout(300)
 
-    if pick and pick.get("picked"):
-        if verbose: print(f"[bot] thinking-mode: selected {pick.get('label')!r}")
-        return True
+    if not ext_pick.get("picked"):
+        if verbose:
+            print(f"[bot] thinking-mode: {wanted_level!r} option not in submenu. "
+                  f"Seen: {ext_pick.get('seen')}")
+        return False
     if verbose:
-        print(f"[bot] thinking-mode: dropdown opened but no Thinking item matched. "
-              f"Seen: {pick.get('seen') if pick else 'n/a'}")
-        # Dump what buttons / menu-items ARE on the page so we can pick the
-        # right selector next iteration.
-        try:
-            labels = await page.evaluate("""
-                () => Array.from(document.querySelectorAll(
-                    'button, [role="button"], [role="menuitem"], [role="option"]'
-                ))
-                    .map(el => {
-                        const a = (el.getAttribute('aria-label')||'').trim();
-                        const t = (el.textContent||'').trim();
-                        const d = (el.getAttribute('data-test-id')||'').trim();
-                        return (a || t || d || '').slice(0, 60);
-                    })
-                    .filter(s => s.length > 0 && s.length < 60)
-                    .slice(0, 60)
-            """)
-            print("[bot] thinking-mode: no control found. Button labels on page:")
-            for lbl in labels:
-                print(f"   • {lbl}")
-        except Exception as e:
-            print(f"[bot] thinking-mode label dump failed: {e}")
-    return False
+        print(f"[bot] thinking-mode: thinking level selected ({ext_pick.get('label')!r})")
+    return True
 
 
 async def _select_create_image_tool(page, verbose: bool = False) -> bool:
-    """Open Gemini's tool picker and select "Create image" so the conversation
-    defaults to image-generation. Returns True on success, False if the picker
-    or the option couldn't be located. Mirrors `_enable_thinking_mode`'s
-    two-step (open dropdown → pick item) pattern; never raises.
+    """Enable Gemini's "Create image" tool for the current conversation.
+
+    UI shape (verified 2026-05-19):
+      • the `+` button next to the prompt input has aria-label="Upload and tools"
+      • clicking it opens a menu whose tool toggles are
+        `<button role="menuitemcheckbox">` with empty aria-label —
+        match by textContent only ("Create image", "Create video", …)
+      • the item carries aria-checked="true|false"; clicking flips it,
+        so we must skip the click if it's already enabled
+    Returns True on success (enabled or already on), False otherwise. Never raises.
     """
     try:
         await _dismiss_modals(page, verbose=False)
     except Exception:
         pass
 
-    # Step 1 — open the tool picker. Score buttons whose aria-label / text
-    # suggests a tool/attachment menu; prefer ones near the prompt input.
     try:
         opened = await page.evaluate("""
             () => {
-                const cands = Array.from(document.querySelectorAll(
-                    'button, [role="button"]'
-                ));
-                const rank = (b) => {
-                    const a = (b.getAttribute('aria-label')||'').toLowerCase().trim();
-                    const t = (b.textContent||'').trim();
-                    const d = (b.getAttribute('data-test-id')||'').toLowerCase();
-                    let s = 0;
-                    if (/^create image$/i.test(a) || /^create image$/i.test(t)) s += 10;
-                    if (/(tool|tools)/.test(a)) s += 4;
-                    if (/(add|plus|attach|more)/.test(a)) s += 2;
-                    if (a === '+' || t === '+') s += 3;
-                    if (d.includes('tool')) s += 3;
-                    const r = b.getBoundingClientRect();
-                    if (r.width < 1 || r.height < 1) s = -1;
-                    return s;
-                };
-                const scored = cands.map(b => ({b, s: rank(b)}))
-                    .filter(x => x.s > 0)
-                    .sort((x, y) => y.s - x.s);
-                if (!scored.length) return {opened: false};
-                const best = scored[0];
-                best.b.click();
-                return {
-                    opened: true,
-                    clicked: (best.b.getAttribute('aria-label') ||
-                              best.b.textContent || '').trim().slice(0, 60),
-                    direct: (best.s >= 10),
-                };
+                const b = Array.from(document.querySelectorAll('button, [role="button"]'))
+                    .find(e => {
+                        const a = (e.getAttribute('aria-label') || '').toLowerCase().trim();
+                        if (a !== 'upload and tools') return false;
+                        const r = e.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                    });
+                if (!b) return {opened: false};
+                b.click();
+                return {opened: true};
             }
         """)
     except Exception as e:
@@ -1125,54 +1175,37 @@ async def _select_create_image_tool(page, verbose: bool = False) -> bool:
         opened = {"opened": False}
 
     if not opened or not opened.get("opened"):
-        if verbose: print("[bot] create-image: tool picker not found")
+        if verbose: print("[bot] create-image: 'Upload and tools' button not found")
         return False
     if verbose:
-        print(f"[bot] create-image: opened tool picker ({opened.get('clicked')!r})")
-
-    # If we already clicked "Create image" directly (button on page, not menu),
-    # we're done.
-    if opened.get("direct"):
-        await page.wait_for_timeout(400)
-        if verbose: print("[bot] create-image: selected directly (no menu)")
-        return True
+        print("[bot] create-image: opened 'Upload and tools' menu")
 
     await page.wait_for_timeout(500)
 
-    # Step 2 — click the "Create image" option in the opened menu.
     try:
         pick = await page.evaluate("""
             () => {
                 const items = Array.from(document.querySelectorAll(
-                    '[role="menuitem"], [role="option"], li button, li, button'
+                    '[role="menuitemcheckbox"], [role="menuitem"]'
                 ));
-                const score = (s) => {
-                    s = (s||'').toLowerCase().trim();
-                    let sc = 0;
-                    if (/create.*image|generate.*image/.test(s)) sc += 8;
-                    if (s === 'image' || s === 'images') sc += 6;
-                    return sc;
-                };
-                const ranked = items.map(el => {
-                    const a = (el.getAttribute('aria-label')||'');
-                    const t = (el.textContent||'');
-                    const r = el.getBoundingClientRect();
-                    return {el, a, t,
-                            score: score(a + ' ' + t),
-                            visible: r.width > 0 && r.height > 0};
-                }).filter(x => x.visible && x.score > 0)
-                  .sort((x, y) => y.score - x.score);
-                if (!ranked.length) {
-                    const seen = items.slice(0, 30).map(el => (
-                        (el.getAttribute('aria-label')||'') ||
-                        (el.textContent||'').trim().slice(0, 40)
-                    )).filter(Boolean);
-                    return {picked: false, seen};
+                const visible = items.filter(e => {
+                    const r = e.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                });
+                const target = visible.find(e =>
+                    (e.textContent || '').trim().toLowerCase() === 'create image'
+                );
+                if (!target) {
+                    return {
+                        picked: false,
+                        seen: visible.slice(0, 20).map(e =>
+                            (e.textContent || '').trim().slice(0, 40)
+                        ).filter(Boolean),
+                    };
                 }
-                const best = ranked[0];
-                best.el.click();
-                return {picked: true,
-                        label: (best.a || best.t || '').trim().slice(0, 80)};
+                const checked = (target.getAttribute('aria-checked') || '').toLowerCase() === 'true';
+                if (!checked) target.click();
+                return {picked: true, alreadyOn: checked};
             }
         """)
     except Exception as e:
@@ -1184,10 +1217,12 @@ async def _select_create_image_tool(page, verbose: bool = False) -> bool:
     await page.wait_for_timeout(300)
 
     if pick and pick.get("picked"):
-        if verbose: print(f"[bot] create-image: selected {pick.get('label')!r}")
+        if verbose:
+            state = "already enabled" if pick.get("alreadyOn") else "enabled"
+            print(f"[bot] create-image: {state}")
         return True
     if verbose:
-        print("[bot] create-image: tool picker opened but no Create-image item matched. "
+        print("[bot] create-image: 'Create image' item not in menu. "
               f"Seen: {pick.get('seen') if pick else 'n/a'}")
     return False
 
@@ -1323,6 +1358,69 @@ async def _click_regenerate(page, verbose: bool = False) -> bool:
     return False
 
 
+async def _click_stop_response(page, verbose: bool = False) -> bool:
+    """Click Gemini's 'Stop response' button to interrupt an in-progress
+    generation. Used after the per-slide image wait gives up so the next
+    slide doesn't have to burn the full _wait_gemini_idle timeout."""
+    try:
+        clicked = await page.evaluate("""
+            () => {
+                const cands = Array.from(document.querySelectorAll(
+                    'button[aria-label], button[data-testid]'
+                ));
+                for (const b of cands) {
+                    const a = (b.getAttribute('aria-label')||'').toLowerCase().trim();
+                    const t = (b.getAttribute('data-testid')||'').toLowerCase().trim();
+                    const labelMatch = a === 'stop' || a.startsWith('stop ') ||
+                                       a === 'stop response' || a === 'stop generating';
+                    const testidMatch = t === 'stop-button' || t === 'stop_button' ||
+                                        t.endsWith('-stop') || t.endsWith('_stop');
+                    if (!labelMatch && !testidMatch) continue;
+                    const r = b.getBoundingClientRect();
+                    if (r.width <= 0 || r.height <= 0) continue;
+                    b.click();
+                    return (b.getAttribute('aria-label') ||
+                            b.getAttribute('data-testid') || '').slice(0, 60);
+                }
+                return null;
+            }
+        """)
+        if clicked:
+            if verbose: print(f"[bot] clicked Stop response ({clicked!r})")
+            await page.wait_for_timeout(400)
+            return True
+        return False
+    except Exception as e:
+        if verbose: print(f"[bot] stop-response click err: {e}")
+        return False
+
+
+async def _count_new_large_images(page, baseline_srcs) -> int:
+    """Count <img> elements whose src is NOT in `baseline_srcs` AND that
+    render at >= 150x150 px. Pins success on src identity rather than a
+    raw total count — survives Gemini's DOM quirks (image-tag reuse,
+    lazy rendering, scrolled-off images with zero bounding box) that
+    cause `_count_images` to undercount."""
+    try:
+        return await page.evaluate("""
+            (baseline) => {
+                const seen = new Set(baseline);
+                let n = 0;
+                for (const i of document.querySelectorAll('img')) {
+                    const src = i.src || i.currentSrc || '';
+                    if (!src || src.startsWith('chrome-')) continue;
+                    if (seen.has(src)) continue;
+                    const r = i.getBoundingClientRect();
+                    if (r.width < 150 || r.height < 150) continue;
+                    n++;
+                }
+                return n;
+            }
+        """, list(baseline_srcs))
+    except Exception:
+        return 0
+
+
 async def _wait_gemini_idle(page, max_wait_s: float = 420.0,
                             verbose: bool = False) -> bool:
     """Block until Gemini is NOT currently generating — i.e. there's no
@@ -1335,6 +1433,12 @@ async def _wait_gemini_idle(page, max_wait_s: float = 420.0,
     """
     deadline = time.time() + max_wait_s
     last_log = 0
+    # When Gemini's Stop button stays visible for 15+s, re-click it. After
+    # a mid-stream-Stop accept in Phase 1, the button can remain stuck
+    # (Gemini auto-resumes thinking, or React ignored the synth click).
+    # One Stop click isn't always enough — keep clicking until it sticks.
+    last_stop_click = 0.0
+    stuck_since: Optional[float] = None
     while time.time() < deadline:
         try:
             # Returns {busy: bool, why: str} — the `why` tells us which
@@ -1383,10 +1487,25 @@ async def _wait_gemini_idle(page, max_wait_s: float = 420.0,
                 # Settle briefly for post-streaming animations.
                 await page.wait_for_timeout(800)
                 return True
+            why = (status or {}).get("why", "") if status else ""
             if verbose and (time.time() - last_log) > 20:
-                why = (status or {}).get("why", "")
                 print(f"[idle] still busy ({int(deadline - time.time())}s left) — {why[:120]}")
                 last_log = time.time()
+            # If the busy reason is the Stop button (not a streaming-attr
+            # flag), repeatedly click Stop until it goes away. First click
+            # after 5 s of stuck-stop, then every 15 s.
+            if why.startswith("stop-btn"):
+                if stuck_since is None:
+                    stuck_since = time.time()
+                stuck_for = time.time() - stuck_since
+                since_click = time.time() - last_stop_click
+                if stuck_for >= 5.0 and since_click >= 15.0:
+                    if verbose:
+                        print(f"[idle] Stop button stuck for {int(stuck_for)}s — re-clicking")
+                    await _click_stop_response(page, verbose=False)
+                    last_stop_click = time.time()
+            else:
+                stuck_since = None
         except Exception: pass
         await asyncio.sleep(2.0)
     if verbose: print("[idle] still busy at timeout")
@@ -1526,10 +1645,59 @@ async def _wait_input_ready(page, max_wait_s: float = 45.0) -> bool:
     return False
 
 
+# Empirically Gemini soft-degrades after ~4 consecutive image gens in a
+# single chat: the 4th prompt's image often doesn't render uniquely (text
+# only, image reuse, or the count check sees a UI element grow), and
+# Phase 2 then has fewer real <img>s than slides → wrong-frame mapping.
+# 3 per chat is the safe ceiling observed in production runs.
+_BATCH_SLIDES_PER_CHAT = 3
+
+
 async def _do_post_sequential_mode(
     post_group: list, wait_timeout: float, verbose: bool, on_done=None,
 ) -> list:
-    """Two-phase single-post flow.
+    """Drive a single post via one or more Gemini chats, each handling up
+    to `_BATCH_SLIDES_PER_CHAT` slides. Delegates each chat-batch to
+    `_do_post_sequential_mode_singlechat`. Caller-visible behavior
+    (return shape, on_done signature with full-post slide_idx) is
+    unchanged when post fits in one batch.
+    """
+    n = len(post_group)
+    if not n:
+        return []
+    if n <= _BATCH_SLIDES_PER_CHAT:
+        return await _do_post_sequential_mode_singlechat(
+            post_group, wait_timeout, verbose, on_done
+        )
+    results: list = [None] * n
+    nbatches = (n + _BATCH_SLIDES_PER_CHAT - 1) // _BATCH_SLIDES_PER_CHAT
+    for bi in range(nbatches):
+        bs = bi * _BATCH_SLIDES_PER_CHAT
+        batch = post_group[bs:bs + _BATCH_SLIDES_PER_CHAT]
+        if verbose:
+            print(f"[seq] chat-batch {bi+1}/{nbatches}: slides "
+                  f"{bs+1}-{bs+len(batch)} of {n} (fresh chat)")
+
+        def _wrapped(post_idx, slide_idx, path, _bs=bs, _od=on_done):
+            if _od:
+                try:
+                    _od(post_idx, slide_idx + _bs, path)
+                except Exception:
+                    pass
+        batch_results = await _do_post_sequential_mode_singlechat(
+            batch, wait_timeout, verbose, _wrapped
+        )
+        for i, r in enumerate(batch_results):
+            results[bs + i] = r
+    return results
+
+
+async def _do_post_sequential_mode_singlechat(
+    post_group: list, wait_timeout: float, verbose: bool, on_done=None,
+) -> list:
+    """Two-phase single-post flow IN ONE CHAT. Wrapped by
+    `_do_post_sequential_mode` which chunks large posts so we don't hit
+    Gemini's per-chat soft limit.
 
     Phase 1 — GENERATE ALL:
       Start a fresh Gemini chat, then for each slide in order:
@@ -1559,8 +1727,19 @@ async def _do_post_sequential_mode(
         await _start_new_chat(page, verbose=verbose)
         await page.wait_for_timeout(1500)
         await _dismiss_modals(page, verbose=False)
-        # Switch to Thinking mode for higher-quality image generation.
-        await _enable_thinking_mode(page, verbose=verbose)
+        # Pick thinking level for this chat batch. Empirically Extended
+        # thinking + long prompts (≥ ~1800 chars) cause Gemini to hang
+        # mid-generation with no streamed response. Downgrade to Standard
+        # when any prompt in the batch crosses the threshold; the chat's
+        # thinking level applies to every turn so we pick once per batch
+        # using the longest prompt in the group.
+        max_prompt_len = max((len(p) for p, _ in post_group), default=0)
+        thinking_level = "Standard" if max_prompt_len >= 1800 else "Extended"
+        if verbose:
+            print(f"[seq] thinking level for this chat: {thinking_level} "
+                  f"(max prompt = {max_prompt_len} chars)")
+        await _enable_thinking_mode(page, verbose=verbose,
+                                    thinking_level=thinking_level)
         # Select the Create-image tool so Gemini defaults to image gen.
         await _select_create_image_tool(page, verbose=verbose)
     except Exception as e:
@@ -1578,6 +1757,10 @@ async def _do_post_sequential_mode(
         await _wait_gemini_idle(page, max_wait_s=wait_timeout, verbose=verbose)
 
         if verbose: print(f"[seq] phase1 slide {i+1}/{n} — sending ({len(prompt)} chars)")
+        # Snapshot every image src already in the DOM. After send we look
+        # for a NEW large src — robust against `_count_images` undercounting
+        # when Gemini reuses tags or images go off-screen.
+        baseline_srcs = await _snapshot_image_srcs(page)
         if not await _send_same_chat_strict(page, prompt, verbose=verbose):
             if verbose: print(f"[seq] phase1 slide {i+1} — SEND FAILED, moving on")
             if on_done:
@@ -1602,15 +1785,31 @@ async def _do_post_sequential_mode(
             attempt_deadline = time.time() + per_attempt_timeout
             stalled_at_idle = False
             while time.time() < attempt_deadline:
-                cnt = await _count_images(page)
+                new_imgs = await _count_new_large_images(page, baseline_srcs)
                 streaming = await page.evaluate("""
                     () => !!(document.querySelector('[data-is-streaming="true"]') ||
                              """ + _JS_STOP_BTN_PRESENT + """)
                 """)
-                if cnt >= expected and not streaming:
+                # Success requires a TRULY NEW large image (src not in
+                # baseline). Old code OR'd this with `_count_images >=
+                # expected`, but the raw count can grow without a real
+                # generation (UI chrome, reused tags), producing Phase 1
+                # false positives that misalign Phase 2's slide→image map.
+                if new_imgs >= 1 and not streaming:
                     grew = True
                     break
-                if not streaming and cnt < expected:
+                # Image already in DOM but Gemini is still streaming —
+                # likely Thinking-mode post-image commentary. Don't wait
+                # for natural idle (can take minutes); interrupt with
+                # Stop and accept success so we proceed to the next slide.
+                if new_imgs >= 1 and streaming:
+                    if verbose:
+                        print(f"[seq] phase1 slide {i+1} — image present "
+                              f"mid-stream, interrupting to proceed")
+                    await _click_stop_response(page, verbose=verbose)
+                    grew = True
+                    break
+                if not streaming and new_imgs < 1:
                     # Gemini finished responding but no image — text-only.
                     stalled_at_idle = True
                     break
@@ -1632,14 +1831,27 @@ async def _do_post_sequential_mode(
             sent_indices.append(i)
             if verbose: print(f"[seq] phase1 slide {i+1} — rendered (imgs now ≥ {expected})")
         else:
-            # Image never appeared — roll the expected counter back so the
-            # next slide's count check isn't offset.
-            expected -= 1
-            if verbose: print(f"[seq] phase1 slide {i+1} — IMAGE TIMEOUT after "
-                              f"{regens} regenerate(s), skipping download")
-            if on_done:
-                try: on_done(0, i, None)
-                except Exception: pass
+            # Last-chance src-diff check: maybe an image DID render but
+            # `_count_images` undercounted (the common failure mode this
+            # patch addresses). If a new large image is in the DOM, treat
+            # the slide as a success.
+            final_new = await _count_new_large_images(page, baseline_srcs)
+            if final_new >= 1:
+                sent_indices.append(i)
+                if verbose: print(f"[seq] phase1 slide {i+1} — rendered "
+                                  f"(src-diff recovered after count check missed)")
+            else:
+                # Image never appeared — roll the expected counter back so
+                # the next slide's count check isn't offset.
+                expected -= 1
+                if verbose: print(f"[seq] phase1 slide {i+1} — IMAGE TIMEOUT after "
+                                  f"{regens} regenerate(s), skipping download")
+                if on_done:
+                    try: on_done(0, i, None)
+                    except Exception: pass
+            # Either way: if Gemini is still streaming, click Stop so the
+            # next slide doesn't burn the full _wait_gemini_idle timeout.
+            await _click_stop_response(page, verbose=verbose)
 
     if not sent_indices:
         return results

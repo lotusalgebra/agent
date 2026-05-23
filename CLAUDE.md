@@ -20,22 +20,17 @@ cd ~/LotusAgent && source venv/bin/activate
 
 ### Canonical startup procedure
 
-Browser-driven agents (`gemini_bot`, `grok_video`, `upwork_agent`) need a CDP-attached Chrome. Order matters — Chrome first, then the agent with `LOTUS_CDP_URL` set:
+Single command (preflight handles Chrome):
 
 ```bash
-# 1. Real Chrome with CDP enabled (signs you into Google / Grok / Upwork once;
-#    the persistent profile at ~/.lotus_auth/chrome_cdp_profile/ remembers).
-"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-  --remote-debugging-port=9222 \
-  --user-data-dir="$HOME/.lotus_auth/chrome_cdp_profile" \
-  https://gemini.google.com/app &
-
-# 2. Boot the agent with the CDP URL.
-cd ~/LotusAgent && source venv/bin/activate
-LOTUS_CDP_URL=http://localhost:9222 python agent_phase1.py v
+cd ~/LotusAgent && source venv/bin/activate && python agent_phase1.py v
 ```
 
-`lotus_preflight.py` codifies this — it discovers Chrome cross-platform (`darwin`/`win32`/Linux paths), launches it with the right flags if not already running, and waits up to 10 min for the user to sign in to Gemini before unblocking the agent. **Don't bypass it** by launching Chrome without `--remote-debugging-port` — the bots have no fallback path.
+`agent_phase1.py:main()` calls `lotus_preflight.ensure_lotus_chrome()` before instantiating the agent. Preflight discovers Chrome cross-platform (`darwin` / `win32` / Linux), reuses an existing Chrome on `:9222` or launches a detached one with `--remote-debugging-port=9222 --user-data-dir=~/.lotus_auth/chrome_cdp_profile/`, waits up to 10 min for Gemini sign-in if needed, then sets `os.environ["LOTUS_CDP_URL"]` so the browser-driven agents (`gemini_bot`, `gemini_bot_human`, `grok_video`, `upwork_agent`) attach via CDP. **Don't bypass it** by launching Chrome without `--remote-debugging-port` — the bots have no fallback path. `LOTUS_SKIP_PREFLIGHT=1` is the sanctioned bypass for voice-only / Ollama-only sessions.
+
+**Mic permission must belong to the launching app** (Terminal / iTerm / the IDE running Python). macOS TCC silently blocks PyAudio for grandchild processes that don't inherit a Microphone grant — the symptom was an indefinite hang at calibration. `voice.py:VoiceEngine.__init__` now runs calibration on a thread with a 10 s timeout and raises a clear platform-specific `RuntimeError` instead (fix shipped 2026-05-04). If calibration ever stalls again, check `lsof -p <pid> | grep -i audio` and System Settings → Privacy & Security → Microphone for the launching terminal.
+
+**Hard requirement: Playwright ≥ 1.59.** `lotus_preflight.ensure_playwright_version` refuses start otherwise — 1.55 had a `Browser.setDownloadBehavior` protocol error attaching to real Chrome via CDP. Upgrade with `pip install -U playwright && python -m playwright install chromium`. (Note: `SESSION_STATUS.md` from 2026-04-27 still warns against upgrading from 1.55 — that warning is superseded.)
 
 ### Python entry points
 
@@ -121,7 +116,7 @@ Agent-mesh path (Phase D — agents.py + lotus-child.py + lotus_mdns.py):
 - **Tool definitions live in two places.** Adding a new tool in `agent.py` requires (1) an entry in the `TOOLS` list with JSON input schema, AND (2) a matching `tool_<name>(self, **params)` on `ToolExecutor` in `tools.py`. `ToolExecutor.execute` dispatches via `getattr(self, f"tool_{tool_name}")` — method names must exactly match tool-name strings.
 - **HybridRouter classification is keyword-based, not LLM-based.** `router.py` has hardcoded `SEARCH_TRIGGERS`, `TASK_TRIGGERS` plus a question-word fallback. If routing looks wrong, adjust the lists — don't add a classifier.
 - **Search routing is browser automation, not API.** `HybridRouter.send_to_claude_chat` locates a Claude.ai tab (AppleScript on macOS), pastes the query via clipboard, presses Enter. The response is **never** programmatically captured — the user reads it in the browser. Don't try to "fix" this.
-- **`_gen_image` has a strict fallback order** (`agent_phase1.py`): (1) `gemini_bot` Playwright web-app, (2) `gemini_api` official API (skipped for the rest of the session once a plan-level 429 is seen — don't waste 30 s/frame retrying), (3) legacy `gemini.py` OCR path (intentionally not called now — returns None so the pipeline advances). Preserve this order and the sticky-skip behavior.
+- **`_gen_image` chain is runtime-configurable, and `human` is deliberately excluded from auto-fallback.** `agent_phase1._GEN_ENGINES` defines three tiers: `playwright` (`gemini_bot.create_image_and_download`), `human` (`gemini_bot_human` — CDP DOM locators + AppleScript Cmd+V + Playwright `page.expect_download()` for the **6.9 MB full-res download**, vs ~697 KB from canvas-export), `api` (`gemini_api`). Default chain is `[playwright, api]`; `human` is excluded by default because its failure modes overlap with playwright's *and* it pops a surprise visible Chrome window. Switch primary live via `POST http://localhost:8766/api/config/pipeline {"pipeline":"human"}`, or persistently via `image.pipeline` in `~/.lotus_config.json`, or via `LOTUS_GEN_IMAGE_PIPELINE`. When `human` is primary the chain becomes `[human, playwright, api]`. `gemini_api` is sticky-skipped for the rest of the session after a plan-level 429 (`_gen_api_plan_blocked`) — don't waste 30 s/frame retrying. **Don't replace the Playwright `page.expect_download()` path with raw CDP clicks** — empirically Chrome silently drops the file when there's no active CDP download subscriber. Legacy `gemini.py` (OCR) is no longer in the chain; kept on disk for reference only.
 - **Voice auth verifies the *same* audio that contained the wake word** (`agent.py::run_voice_loop`). The raw `AudioData` from the wake-word utterance is passed to `VoiceAuth.verify`. Refactoring to re-listen after the wake word would let an attacker play a "Lotus" recording of the user and then speak commands themselves — keep the single-audio verification.
 - **`agent_phase1.py` is the daily orchestrator, not a toy.** It imports `voice.py`, `lotus_config.py`, `lotus_history.py`, `lotus_recorder.py`, `prompts_parser.py`, `lotus_prompts_db.py`, and the gemini modules. It does **not** import `tools.py`, `router.py`, `auth.py`, or `server.py` — the two agents represent different trust/capability tiers. Don't DRY them together.
 - **`browser.py` is the one true browser primitive module.** `focus_chrome_tab`, `open_url`, `screenshot`, `ocr_data`, `find_text`, `click`, `paste_text`, `press`, `wait_for_text`. Prefer composing these over hardcoded `pyautogui` coordinates — UI elements are located by OCR so automations survive Google UI refreshes.
@@ -199,7 +194,23 @@ LOTUS is being built to ship as a paid Mac+Windows desktop product (see `PRODUCT
 - **Distribution surfaces:**
   - `lotus-desktop/` — Electron LAN client. Builds via `npm run build:mac|win|linux` (electron-builder, NSIS for Windows, dmg for Mac, AppImage for Linux). App ID `com.lotusalgebra.lotus-agent`.
   - `packaging/` — PyInstaller specs for the **child worker** installer (`packaging/lotus-child.spec` is the cross-platform source of truth). Per-platform builds via `packaging/windows/build.bat` (WiX MSI) or `packaging/mac/build.sh` (pkgbuild + productbuild). **Cross-compilation isn't supported** — each platform's installer must be built on that platform.
-  - The mother bundle isn't packaged yet — that's Phase 1 of `PRODUCTIZATION_PLAN.md`.
+  - **Unified `LOTUS Agent.app` (Mac, arm64)** — shipped 2026-05-04, completes Phase 1 of `PRODUCTIZATION_PLAN.md`. Build is **strictly two steps, in this order** (electron-builder copies from PyInstaller's output, so it fails if `dist/lotus-mother/` is missing):
+    ```bash
+    pyinstaller packaging/lotus-mother.spec --clean --noconfirm    # ~2 min, ~762 MB → dist/lotus-mother/
+    cd lotus-desktop && npm run build:mac                          # ~3 min, ~1 GB → lotus-desktop/dist/mac-arm64/
+    ```
+    `lotus-desktop/main.js` spawns the bundled mother on launch, polls `:8766` until ready (60 s timeout), reads token from `~/.lotus_auth/token.txt`, opens the dashboard, and SIGTERMs the mother on `before-quit`. `mac.extendInfo.NSMicrophoneUsageDescription` gives the .app its own TCC entry — child Python inherits the mic grant, which is what eliminated the calibration-hang class of bugs. Currently ad-hoc signed (Gatekeeper warning + right-click → Open on first launch); switch to Developer ID + notarize for customer distribution. Whisper, tiktoken, and the ~5 GB Gemma weights are intentionally NOT bundled — user installs Ollama + Chrome separately. **The obsolete `typing` backport breaks PyInstaller** — if a `pip install` re-introduces it, `pip uninstall typing -y` before rebuilding. `bundledMother: true` in saved settings marks a local-mother install (vs. the LAN-client mode connecting to a remote mother).
+
+## Source control
+
+Repo: **github.com/lotusalgebra/agent** (first push 2026-05-05). Branch model:
+- `main` — stable, customer-facing
+- `dev` — active development; merge to `main` when stable
+- `release-YYYY-MM-DD` — cut from `dev` after a successful PyInstaller + electron-builder build, named for the build date. The produced `.app` / `.dmg` traces back to that tag.
+
+`.gitignore` excludes `venv/`, `node_modules/`, `dist/`, `build/`, `Projects/` and `uploads/` (private client content), `*.db`, `.lotus_auth/`, `*.npz`, `*token*.txt`, `*api_key*.txt`, `vendor/`, `reports/`, `recordings/`, `.lotus_screenshots/`. **Before adding any commit:** if you introduce code with a hardcoded `/Users/rasoindia/...` path or a credential, parameterise it (`os.path.expanduser`, env var, or `~/.lotus_auth/` lookup) — the .gitignore catches *currently known* leaks, not new files with absolute home paths.
+
+`gh auth login && gh auth setup-git` is required for `git push` (https credentials wired through gh). Commit identity: `Somendra <somendra@lotusalgebra.com>`.
 
 ## macOS-specific gotchas
 
@@ -214,5 +225,7 @@ LOTUS is being built to ship as a paid Mac+Windows desktop product (see `PRODUCT
 
 - `tools.py::tool_run_command` blocks a hardcoded destructive-command list (`rm -rf /`, `mkfs`, `dd if=`, fork bomb, etc.), enforces 30 s timeout + 3000-char output cap. Extend the blocklist if you find gaps; don't weaken it.
 - `pyautogui.FAILSAFE = True` set in `tools.py::_init_screen` and `browser.py` — slamming the mouse into a screen corner aborts automation. Preserve this.
+- `lotus_preflight.ensure_crBrowser_patch` auto-reapplies the `Browser.setDownloadBehavior` `.catch(() => {})` wrapper to `venv/.../chromium/crBrowser.js` if `pip install -U playwright` clobbers it. Idempotent — keep, otherwise downloads fail after every Playwright upgrade.
+- `gemini_bot._connect_cdp_with_retry` retries `connect_over_cdp` once after tearing down the Playwright instance, so transient CDP-attach failures don't kill a render burst.
 - `lotus_recorder.py` is the engine; pair any recording with a visible REC indicator in the UI — never hide recording from the user.
 - Conversation history in `agent.py` auto-trims to last 30 messages after reaching 40 to keep token usage bounded.

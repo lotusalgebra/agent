@@ -311,6 +311,14 @@ def extract_candidates(md_text: str) -> list:
             expanded.append(c)
     candidates = expanded
 
+    # Drop video-stitching prompts. REEL packs include `## ACT N — GROK
+    # STITCHING PROMPT` blocks alongside the per-keyframe NB2 prompts; the
+    # stitching ones are instructions for Grok's image-to-video stage and
+    # must NOT enter the image-generation pipeline.
+    candidates = [c for c in candidates
+                  if "stitching" not in (c.get("title") or "").lower()
+                  and "stitching" not in (c.get("text") or "")[:120].lower()]
+
     # Smart de-dup: prefer 'label' candidates (just the prompt body) over
     # 'box_section' / 'section' candidates (whole slide with surrounding
     # metadata). Drop any non-label candidate whose content contains a
