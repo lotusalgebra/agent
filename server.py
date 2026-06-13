@@ -312,6 +312,58 @@ class DashboardServer:
                 self.end_headers()
 
             def do_POST(self):
+                # Reveal an already-saved frame in the OS file manager (Finder
+                # on macOS). The frame is rendered straight to the project
+                # folder, so the UI's old "download" affordance — which popped a
+                # save-location dialog in both the desktop app and the browser —
+                # was wrong. This reveals the existing file instead. Body:
+                # {"path": "<absolute>"} or {"path": "/projects/<rel>"}.
+                if self.path.startswith("/api/reveal"):
+                    try:
+                        import subprocess, sys as _sys
+                        length = int(self.headers.get("Content-Length", "0"))
+                        raw = self.rfile.read(length) if length > 0 else b"{}"
+                        req = json.loads(raw or b"{}")
+                        raw_path = (req.get("path") or "").strip()
+                        root = os.path.realpath(_live_projects_root())
+                        if raw_path.startswith("/projects/"):
+                            raw_path = os.path.join(root, raw_path[len("/projects/"):])
+                        target = os.path.realpath(os.path.expanduser(raw_path))
+
+                        def _reply(code, obj):
+                            body = json.dumps(obj).encode()
+                            self.send_response(code)
+                            self.send_header("Content-Type", "application/json")
+                            self.send_header("Access-Control-Allow-Origin", "*")
+                            self.send_header("Content-Length", str(len(body)))
+                            self.end_headers()
+                            self.wfile.write(body)
+
+                        # Guard: only reveal files inside the projects root.
+                        try:
+                            inside = os.path.commonpath([target, root]) == root
+                        except ValueError:
+                            inside = False
+                        if not raw_path or not inside:
+                            _reply(403, {"error": "path outside projects root"}); return
+                        if not os.path.exists(target):
+                            _reply(404, {"error": "not found"}); return
+                        if _sys.platform == "darwin":
+                            subprocess.Popen(["open", "-R", target])
+                        elif _sys.platform == "win32":
+                            subprocess.Popen(["explorer", f"/select,{target}"])
+                        else:
+                            subprocess.Popen(["xdg-open", os.path.dirname(target)])
+                        _reply(200, {"ok": True, "revealed": target}); return
+                    except Exception as e:
+                        body = json.dumps({"error": str(e)}).encode()
+                        self.send_response(500)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
                 # Frame upload — user provides a manually-generated image for
                 # a specific failed frame. Query: ?frame_id=fX&new_name=foo.png
                 # Body: raw image bytes (PNG/JPEG). We write to a temp file
@@ -632,6 +684,78 @@ class DashboardServer:
                         self.end_headers()
                         self.wfile.write(body)
                         return
+                    except Exception as e:
+                        body = json.dumps({"error": str(e)}).encode()
+                        self.send_response(500)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body); return
+                # /api/pipelines/<id>/frames → saved frames for ANY pipeline,
+                # including terminal (done/cancelled) ones that are no longer
+                # in the live registry. The A2 overview opens these read-only.
+                # Keyed by folder_name (the filesystem is the source of truth)
+                # rather than a history run_id, which doesn't map to the
+                # pipelines.db hex id. Must precede the generic /api/pipelines
+                # prefix check below.
+                if self.path.startswith("/api/pipelines/") and "/frames" in self.path:
+                    try:
+                        import lotus_pipelines_db as _pdb
+                        projects_dir_now = _live_projects_root()
+                        pid = self.path[len("/api/pipelines/"):]
+                        pid = pid.split("/frames")[0].split("?")[0]
+                        row = _pdb.get(pid)
+                        frames = []
+                        folder = (row or {}).get("folder_name")
+                        if folder:
+                            base = os.path.join(projects_dir_now, folder)
+                            if os.path.isdir(base):
+                                for r, _, files in os.walk(base):
+                                    for fn in sorted(files):
+                                        if not fn.lower().endswith(
+                                                (".png", ".jpg", ".jpeg", ".webp")):
+                                            continue
+                                        fpath = os.path.join(r, fn)
+                                        rel = os.path.relpath(
+                                            fpath, projects_dir_now).replace(os.sep, "/")
+                                        section = os.path.relpath(r, base).replace(os.sep, "/")
+                                        if section == ".":
+                                            section = ""
+                                        frames.append({
+                                            "name": fn,
+                                            "section": section,
+                                            "url": "/projects/" + rel,
+                                        })
+                        # Sort: sectioned frames first (Post1, Post2, …), then
+                        # top-level single slots; natural (numeric-aware) order
+                        # so Frame2 precedes Frame10 within each section.
+                        def _natkey(s):
+                            key, num = [], ""
+                            for ch in s:
+                                if ch.isdigit():
+                                    num += ch
+                                else:
+                                    if num:
+                                        key.append((1, int(num), "")); num = ""
+                                    key.append((0, -1, ch.lower()))
+                            if num:
+                                key.append((1, int(num), ""))
+                            return key
+                        frames.sort(key=lambda f: (f["section"] == "",
+                                                   _natkey(f["section"]),
+                                                   _natkey(f["name"])))
+                        body = json.dumps({
+                            "pipeline": row,
+                            "folder": folder or "",
+                            "frames": frames,
+                        }).encode()
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.send_header("Cache-Control", "no-store")
+                        self.end_headers()
+                        self.wfile.write(body); return
                     except Exception as e:
                         body = json.dumps({"error": str(e)}).encode()
                         self.send_response(500)

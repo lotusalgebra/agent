@@ -4142,14 +4142,23 @@ function GalleryTab() {
                     title="Next (→)">
                     <ChevronRight size={18} />
                   </button>
-                  <a
-                    href={preview.url}
-                    download={`${preview.post}-Frame${preview.frame_num}.png`}
-                    onClick={(e) => e.stopPropagation()}
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      // Frame is already saved to the project folder during
+                      // generation — reveal it in Finder instead of popping a
+                      // save-location dialog (which the old download link did
+                      // in both the desktop app and the browser).
+                      fetch('/api/reveal', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ path: preview.path || preview.url }),
+                      }).catch(() => {});
+                    }}
                     className="p-2 rounded-lg bg-white/10 hover:bg-white/20 text-white transition-colors flex items-center justify-center"
-                    title="Download full-size">
-                    <Download size={18} />
-                  </a>
+                    title="Reveal in Finder — already saved to the project folder">
+                    <FolderOpen size={18} />
+                  </button>
                   <button
                     onClick={() => setPreview(null)}
                     className="p-2 rounded-lg bg-white/10 hover:bg-white/20 text-white transition-colors"
@@ -4182,8 +4191,9 @@ interface PipelineRow {
                                 // they fall back to <brand><MMDDYYYY>
 }
 
-function PipelinesOverview({ onFocus, onCreate, onDelete, onBackfill, liveIds }: {
+function PipelinesOverview({ onFocus, onReopen, onCreate, onDelete, onBackfill, liveIds }: {
   onFocus: (id: string) => void;
+  onReopen: (id: string) => void;
   onCreate: (name: string) => void;
   onDelete: (id: string, name: string) => void;
   onBackfill: (id: string, name: string) => void;
@@ -4194,6 +4204,10 @@ function PipelinesOverview({ onFocus, onCreate, onDelete, onBackfill, liveIds }:
   const [err, setErr] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState('');
+  // When set, the read-only saved-frames gallery is open for this pipeline.
+  // Lets finished/cancelled pipelines (not in the live registry) be reviewed
+  // without re-entering the live focused view.
+  const [viewing, setViewing] = useState<PipelineRow | null>(null);
 
   const fetchAll = useCallback(async () => {
     setLoading(true); setErr(null);
@@ -4353,15 +4367,14 @@ function PipelinesOverview({ onFocus, onCreate, onDelete, onBackfill, liveIds }:
                 <Trash2 size={13} />
               </button>
               <button
-                onClick={() => { if (isLive) onFocus(p.id); }}
-                disabled={!isLive}
-                title={isLive ? 'Click to focus this pipeline' : 'Pipeline no longer in live registry — view-only'}
+                onClick={() => { if (isLive) onFocus(p.id); else setViewing(p); }}
+                title={isLive ? 'Click to focus this pipeline' : 'Click to view saved frames (read-only)'}
                 className="text-left w-full"
                 style={{
                   background: 'transparent',
                   border: 'none',
                   padding: 0,
-                  cursor: isLive ? 'pointer' : 'default',
+                  cursor: 'pointer',
                   color: 'inherit',
                 }}>
               <div className="flex items-start justify-between gap-2 mb-2 pr-9">
@@ -4446,6 +4459,153 @@ function PipelinesOverview({ onFocus, onCreate, onDelete, onBackfill, liveIds }:
             </div>
           );
         })}
+      </div>
+
+      {viewing && (
+        <FinishedPipelineGallery row={viewing} onClose={() => setViewing(null)} onReopen={onReopen} />
+      )}
+    </div>
+  );
+}
+
+// Read-only gallery for a pipeline's saved frames. Used by the A2 overview to
+// review finished/cancelled pipelines that are no longer in the live registry.
+// Pulls straight from disk via /api/pipelines/<id>/frames (keyed by folder_name)
+// so it works regardless of whether the pipeline is still live.
+function FinishedPipelineGallery({ row, onClose, onReopen }: {
+  row: PipelineRow;
+  onClose: () => void;
+  onReopen: (id: string) => void;
+}) {
+  const [frames, setFrames] = useState<{ name: string; section: string; url: string }[]>([]);
+  const [folder, setFolder] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true); setErr(null);
+    fetch(`/api/pipelines/${encodeURIComponent(row.id)}/frames`)
+      .then(r => r.json())
+      .then(j => {
+        if (!alive) return;
+        if (j.error) throw new Error(j.error);
+        setFrames(j.frames || []);
+        setFolder(j.folder || '');
+      })
+      .catch((e: any) => { if (alive) setErr(e?.message || 'load failed'); })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [row.id]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  // Preserve the backend ordering (sectioned first) while grouping for display.
+  const sections: string[] = [];
+  for (const f of frames) {
+    const key = f.section || '(top level)';
+    if (!sections.includes(key)) sections.push(key);
+  }
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: 'fixed', inset: 0, zIndex: 100,
+        background: 'rgba(3,6,15,0.82)', backdropFilter: 'blur(3px)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24,
+      }}>
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: '#0a0f1c', border: '1px solid #1a2333', borderRadius: 12,
+          width: 'min(1100px, 94vw)', maxHeight: '88vh',
+          display: 'flex', flexDirection: 'column', overflow: 'hidden',
+          boxShadow: '0 24px 80px rgba(0,0,0,0.55)',
+        }}>
+        <div className="flex items-start justify-between gap-3"
+             style={{ padding: '16px 18px', borderBottom: '1px solid #1a2333' }}>
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <h3 className="text-[14px] font-semibold text-text truncate">{row.name}</h3>
+              <span className="px-2 py-0.5 rounded-full text-[10px] font-mono uppercase tracking-wider shrink-0"
+                    style={{ background: 'rgba(127,138,163,0.12)', color: '#7f8aa3', border: '1px solid rgba(127,138,163,0.3)' }}>
+                read-only
+              </span>
+            </div>
+            <div className="text-[11px] text-text-dim mt-0.5 truncate" style={{ fontFamily: 'JetBrains Mono, monospace' }}>
+              {folder || row.folder_name || '(no folder)'} · {frames.length} frame{frames.length === 1 ? '' : 's'}
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              onClick={() => { onReopen(row.id); onClose(); }}
+              title="Reopen this pipeline in the Pipeline view so you can regenerate individual frames"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[11px] font-semibold transition-colors"
+              style={{
+                background: 'rgba(0,229,255,0.12)', color: '#00e5ff',
+                border: '1px solid rgba(0,229,255,0.4)', cursor: 'pointer',
+              }}>
+              <RefreshCw size={12} /> Reopen to regenerate
+            </button>
+            <button onClick={onClose}
+              title="Close (Esc)"
+              style={{
+                width: 30, height: 30, borderRadius: 6, border: '1px solid #1a2333',
+                background: 'transparent', color: '#7f8aa3', cursor: 'pointer',
+                fontSize: 15, lineHeight: 1,
+              }}>✕</button>
+          </div>
+        </div>
+
+        <div style={{ overflowY: 'auto', padding: 18 }}>
+          {loading && (
+            <div className="text-[12px] text-text-dim text-center" style={{ padding: '40px 0' }}>
+              Loading saved frames…
+            </div>
+          )}
+          {err && (
+            <div className="text-[12px] text-red-400 bg-red-500/10 border border-red-500/30 rounded-md px-3 py-2">
+              {err}
+            </div>
+          )}
+          {!loading && !err && frames.length === 0 && (
+            <div className="text-[12px] text-text-dim text-center" style={{ padding: '40px 0' }}>
+              No saved frames found on disk for this pipeline.
+            </div>
+          )}
+          {!loading && !err && sections.map(sec => (
+            <div key={sec} style={{ marginBottom: 18 }}>
+              {sections.length > 1 && (
+                <div className="text-[11px] font-semibold text-text-dim uppercase tracking-wider" style={{ marginBottom: 8 }}>
+                  {sec}
+                </div>
+              )}
+              <div className="grid gap-3"
+                   style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))' }}>
+                {frames.filter(f => (f.section || '(top level)') === sec).map(f => (
+                  <button key={f.url}
+                    onClick={() => window.open(f.url, '_blank')}
+                    title={`${f.name} — open full size`}
+                    style={{
+                      background: '#05080f', border: '1px solid #1a2333', borderRadius: 8,
+                      overflow: 'hidden', cursor: 'pointer', padding: 0, textAlign: 'left',
+                    }}>
+                    <img src={f.url} alt={f.name} loading="lazy"
+                         style={{ width: '100%', aspectRatio: '1 / 1', objectFit: 'cover', display: 'block' }} />
+                    <div className="text-[10px] text-text-dim truncate" style={{ padding: '5px 7px' }}>
+                      {f.name}
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   );
@@ -6990,6 +7150,12 @@ export default function App() {
               liveIds={new Set(pipelineList.map(p => p.id))}
               onFocus={(id) => {
                 handleAction('pipeline_focus', { id });
+                setActiveTab('pipeline');
+              }}
+              onReopen={(id) => {
+                // Reactivate a finished pipeline into the live registry, then
+                // jump to the Pipeline view where per-frame Regenerate lives.
+                directAction('reopen_pipeline', { id });
                 setActiveTab('pipeline');
               }}
               onCreate={(name) => {
