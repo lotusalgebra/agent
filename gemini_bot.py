@@ -951,8 +951,9 @@ async def _enable_thinking_mode(page, verbose: bool = False,
 
     UI shape (verified 2026-05-19):
       • the model/mode button next to the prompt input has
-        aria-label="Open mode picker" and shows the current model name
-        as its textContent ("Flash-Lite", "3.1 Pro", …)
+        aria-label="Open mode picker, currently <Model> <Level>" (the
+        suffix was added ~2026-06; match by prefix) and shows the current
+        model name as its textContent ("Flash-Lite", "3.1 Pro", …)
       • clicking it opens a menu of <gem-menu-item role="menuitem">
         entries with EMPTY aria-label — match by textContent:
           - "3.1 Pro Advanced maths and code"   (model)
@@ -974,7 +975,10 @@ async def _enable_thinking_mode(page, verbose: bool = False,
                     const b = Array.from(document.querySelectorAll('button, [role="button"]'))
                         .find(e => {
                             const a = (e.getAttribute('aria-label') || '').toLowerCase().trim();
-                            if (a !== 'open mode picker') return false;
+                            // Gemini now appends the current model/level to the
+                            // label, e.g. "open mode picker, currently pro extended"
+                            // — match by prefix, not exact equality (2026-06-13).
+                            if (!a.startsWith('open mode picker')) return false;
                             const r = e.getBoundingClientRect();
                             return r.width > 0 && r.height > 0;
                         });
