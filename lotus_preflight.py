@@ -194,12 +194,19 @@ def launch_chrome(profile_dir: Path = DEFAULT_PROFILE_DIR,
 MIN_PLAYWRIGHT_VERSION = "1.59"
 
 # Stable substrings used to locate (and reapply) the LOTUS patch in
-# Playwright's crBrowser.js. The patch wraps a browser-level CDP call
-# that real Chrome rejects (Chromium-for-Testing accepts it). Without
-# the wrap, connect_over_cdp raises and the burst dies.
+# Playwright's bundled JS. The patch wraps a browser-level CDP call
+# (Browser.setDownloadBehavior) that real Chrome rejects with "Browser
+# context management is not supported." (Chromium-for-Testing accepts it).
+# Without the wrap, connect_over_cdp raises and the render burst dies.
+#
+# Playwright relocated this code: <= 1.59 ships it as a standalone
+# server/chromium/crBrowser.js (pretty-printed); 1.60+ inlines it into a
+# minified lib/coreBundle.js. We patch whichever file is present. The
+# marker is a bare substring ("LOTUS patch:") so it matches both the
+# pretty `// LOTUS patch:` and the minified `/* LOTUS patch: */` comment.
+_CRBROWSER_MARKER = "LOTUS patch:"
 _CRBROWSER_REL = ("driver", "package", "lib", "server", "chromium",
                   "crBrowser.js")
-_CRBROWSER_MARKER = "// LOTUS patch:"
 _CRBROWSER_UNPATCHED = (
     '    if (this._browser.options.name !== "clank" && this._options.acceptDownloads !== "internal-browser-default") {\n'
     '      promises.push(\n'
@@ -230,6 +237,32 @@ _CRBROWSER_PATCHED = (
     '    }'
 )
 
+# Playwright >= 1.60: same call, minified into lib/coreBundle.js. The
+# patched form differs from the unpatched only by the appended `.catch`,
+# so we derive it to guarantee they stay in lockstep.
+_COREBUNDLE_REL = ("driver", "package", "lib", "coreBundle.js")
+_COREBUNDLE_UNPATCHED = (
+    'promises.push(this._browser._session.send("Browser.setDownloadBehavior", {\n'
+    '            behavior: this._options.acceptDownloads === "accept" ? "allowAndName" : "deny",\n'
+    '            browserContextId: this._browserContextId,\n'
+    '            downloadPath: this._browser.options.downloadsPath,\n'
+    '            eventsEnabled: true\n'
+    '          }));'
+)
+_COREBUNDLE_PATCHED = _COREBUNDLE_UNPATCHED.replace(
+    '          }));',
+    '          }).catch(() => {/* LOTUS patch: real Chrome rejects '
+    'browser-level setDownloadBehavior */}));',
+)
+
+# (relative path, unpatched template, patched template, human label).
+# Checked in order; every file that exists is patched (only one normally
+# does, per Playwright version).
+_CDP_PATCH_TARGETS = (
+    (_CRBROWSER_REL, _CRBROWSER_UNPATCHED, _CRBROWSER_PATCHED, "crBrowser.js"),
+    (_COREBUNDLE_REL, _COREBUNDLE_UNPATCHED, _COREBUNDLE_PATCHED, "coreBundle.js"),
+)
+
 
 def _version_tuple(v: str) -> tuple:
     return tuple(int(p) for p in v.split(".") if p.isdigit())
@@ -258,34 +291,42 @@ def ensure_playwright_version(min_version: str = MIN_PLAYWRIGHT_VERSION,
 
 
 def ensure_crBrowser_patch(log: Callable[[str], None] = print) -> None:
-    """Re-apply the LOTUS Chrome-CDP patch to playwright's crBrowser.js if it
-    has been wiped (e.g. by `pip install -U playwright`).
+    """Re-apply the LOTUS Chrome-CDP download patch to Playwright's bundled JS
+    if it has been wiped (e.g. by `pip install -U playwright`).
 
-    Idempotent — checks for the marker comment first. If Playwright internals
-    have moved (the unpatched template no longer matches), logs a warning
-    and skips rather than corrupting the file.
+    Patches whichever file the installed Playwright uses — the legacy
+    server/chromium/crBrowser.js (<= 1.59) and/or the minified
+    lib/coreBundle.js (1.60+). Idempotent: checks for the marker comment
+    first. If a file exists but its unpatched template no longer matches,
+    logs a warning and skips it rather than corrupting the file.
     """
     try:
         import playwright
     except ImportError:
-        log("[preflight] playwright not installed — skipping crBrowser patch")
+        log("[preflight] playwright not installed — skipping CDP download patch")
         return
-    target = Path(playwright.__file__).parent.joinpath(*_CRBROWSER_REL)
-    if not target.exists():
-        log(f"[preflight] crBrowser.js not found at {target} — skipping patch")
-        return
-    src = target.read_text(encoding="utf-8")
-    if _CRBROWSER_MARKER in src:
-        log("[preflight] crBrowser.js: LOTUS patch already applied")
-        return
-    if _CRBROWSER_UNPATCHED not in src:
-        log("[preflight] crBrowser.js: unpatched template not matched — "
-            "Playwright internals may have changed. Patch NOT applied; "
-            "connect_over_cdp may fail.")
-        return
-    target.write_text(src.replace(_CRBROWSER_UNPATCHED, _CRBROWSER_PATCHED, 1),
-                      encoding="utf-8")
-    log("[preflight] crBrowser.js: LOTUS patch re-applied")
+    root = Path(playwright.__file__).parent
+    found_any = False
+    for rel, unpatched, patched, label in _CDP_PATCH_TARGETS:
+        target = root.joinpath(*rel)
+        if not target.exists():
+            continue
+        found_any = True
+        src = target.read_text(encoding="utf-8")
+        if _CRBROWSER_MARKER in src:
+            log(f"[preflight] {label}: LOTUS CDP patch already applied")
+            continue
+        if unpatched not in src:
+            log(f"[preflight] {label}: unpatched template not matched — "
+                "Playwright internals may have changed. Patch NOT applied; "
+                "connect_over_cdp may fail.")
+            continue
+        target.write_text(src.replace(unpatched, patched, 1), encoding="utf-8")
+        log(f"[preflight] {label}: LOTUS CDP patch re-applied")
+    if not found_any:
+        log("[preflight] no known Playwright CDP-download file found "
+            f"(checked crBrowser.js + coreBundle.js under {root}) — "
+            "patch skipped; connect_over_cdp may fail.")
 
 
 # ── Orchestrator ───────────────────────────────────────────────────────
