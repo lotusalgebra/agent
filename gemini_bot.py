@@ -1165,7 +1165,9 @@ async def _select_create_image_tool(page, verbose: bool = False) -> bool:
                 const b = Array.from(document.querySelectorAll('button, [role="button"]'))
                     .find(e => {
                         const a = (e.getAttribute('aria-label') || '').toLowerCase().trim();
-                        if (a !== 'upload and tools') return false;
+                        // Prefix match — Gemini may append state to the label
+                        // (as it did to the mode picker), so avoid exact equality.
+                        if (!a.startsWith('upload and tools')) return false;
                         const r = e.getBoundingClientRect();
                         return r.width > 0 && r.height > 0;
                     });
