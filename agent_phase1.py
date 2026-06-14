@@ -1058,6 +1058,14 @@ def _sanitize_for_folder(s: str, max_len: int = 30) -> str:
 _FOLDER_NAME_UNSET = object()
 
 
+def _prompt_text_hash(text: str) -> str:
+    """SHA-1 of the prompt's text, used by the frame-resume check to verify
+    that an on-disk FrameN.png was generated from the same prompt we're now
+    about to render — see lotus_pipelines_db.frame_provenance_hash."""
+    import hashlib as _hashlib
+    return _hashlib.sha1((text or "").encode("utf-8")).hexdigest()
+
+
 class Pipeline:
     """In-memory state for the interactive content pipeline.
 
@@ -1083,8 +1091,12 @@ class Pipeline:
         if folder_name is _FOLDER_NAME_UNSET:
             slug = _sanitize_for_folder(raw_name)
             today = datetime.now().strftime("%m%d%Y")
+            # Always include `id` so two pipelines with the same name on the
+            # same day get distinct folders. Without this, a fresh pipeline
+            # would land in the previous one's folder and the resume check
+            # below would adopt its stale FrameN.png files (off-by-one bug).
             if slug:
-                self.folder_name: Optional[str] = f"{slug}_{today}"
+                self.folder_name: Optional[str] = f"{slug}_{self.id}_{today}"
             else:
                 self.folder_name = f"pipeline{self.id}_{today}"
         else:
@@ -1386,6 +1398,12 @@ class LotusPhase1:
                     result = f"Focus switched to {fid}."
                 else:
                     result = f"Could not focus pipeline {fid!r}."
+            elif action == "reopen_pipeline":
+                # Reactivate a finished/terminal pipeline into the live
+                # registry (force-paused at review_frames) so the user can
+                # regenerate individual frames. See _reopen_pipeline.
+                result = self._reopen_pipeline(
+                    payload.get("id") or payload.get("pipeline_id"))
             elif action == "start_pipeline":
                 # Manual creation from the All-Pipelines overview button.
                 # Name only — the new pipeline parks at ask_location, user
@@ -4417,6 +4435,102 @@ class LotusPhase1:
             results.append((f"Post{post_idx}", frame_idx))
         return results
 
+    def _reopen_pipeline(self, fid: str) -> str:
+        """Bring a finished/terminal pipeline back into the live registry so
+        its frames can be reviewed and individually regenerated.
+
+        Reconstructs prompts (from the review-gate DB) and frames (from disk,
+        using the SAME `_infer_post_slots` + `next_frame_path` derivation the
+        generator uses, so the frame↔prompt mapping is exact and we adopt the
+        existing FrameN.png files instead of allocating new slots). Lands
+        force-paused at `review_frames`; NO rendering is kicked — the user
+        explicitly hits Regenerate on the bad frames, which reuses the live
+        per-frame regen path. Idempotent: an already-live pipeline is just
+        focused."""
+        if not fid:
+            return "reopen: id required"
+        if fid in self._pipelines:
+            self._focus_pipeline(fid)
+            return f"Reopened {fid} (already live)."
+        row = lotus_pipelines_db.get(fid)
+        if not row:
+            return f"reopen: pipeline {fid!r} not found"
+        p = Pipeline(row["id"], row.get("source_md") or "",
+                     name=row.get("name") or "",
+                     folder_name=row.get("folder_name"))
+        p.source_hash = row.get("source_hash")
+        p.created_at = float(row.get("created_at") or p.created_at)
+        p.cancelled = False
+        # Prompts from the review-gate DB (same shape as rehydrate).
+        if p.source_hash:
+            try:
+                rs = lotus_prompts_db.list_for_source(p.source_hash)
+                p.prompts = [
+                    {
+                        "id":           str(r["id"]),
+                        "db_id":        r["id"],
+                        "title":        r["slide_title"],
+                        "topic_number": r["topic_number"],
+                        "slide_number": r["slide_number"],
+                        "text":         r["edited_text"] or r["text"],
+                        "edited":       bool(r["edited_text"]),
+                        "status":       r["status"],
+                    }
+                    for r in rs
+                ]
+            except Exception as e:
+                print(f"[reopen] prompt reload for {fid} failed ({e})", flush=True)
+        # Reconstruct frames from disk using the generator's own derivation so
+        # FrameN.png files map back to their originating prompt exactly.
+        try:
+            pipeline_parent = p.parent_folder()
+            slots = self._infer_post_slots(p.prompts)
+            root = os.path.expanduser(
+                lotus_config.load()["image"].get(
+                    "projects_root", "~/LotusAgent/Projects"))
+            p.frames = []
+            for i, prompt in enumerate(p.prompts):
+                if prompt.get("status") != "approved":
+                    continue
+                section, slide_idx = slots[i]
+                try:
+                    target_path = lotus_config.next_frame_path(
+                        section, slide_idx, parent=pipeline_parent)
+                except Exception:
+                    target_path = lotus_config.next_frame_path(
+                        "Post1", parent=pipeline_parent)
+                    section = "Post1"
+                rel = os.path.relpath(target_path, root).replace(os.sep, "/")
+                url = "/projects/" + rel
+                exists = (os.path.exists(target_path)
+                          and os.path.getsize(target_path) > 2048)
+                p.frames.append({
+                    "id":          f"f{i+1}",
+                    "prompt_id":   prompt["id"],
+                    "prompt_text": prompt["text"],
+                    "section":     section,
+                    "slide_idx":   slide_idx,
+                    "final_path":  target_path,
+                    "final_url":   url if exists else None,
+                    "temp_url":    url if exists else None,
+                    "status":      "pending_review" if exists else "failed",
+                    "resumed":     exists,
+                    "source":      "lotus" if exists else None,
+                    "error":       None if exists else "missing on disk — regenerate",
+                    "retry_count": 0,
+                })
+        except Exception as e:
+            print(f"[reopen] frame reconstruct for {fid} failed ({e})", flush=True)
+            p.frames = []
+        p.stage = "review_frames"
+        p.paused = True
+        p.pause_reason = "reopened to regenerate frames"
+        self._pipelines[fid] = p
+        self._focus_pipeline(fid)
+        self._pipeline_broadcast()
+        n = len(p.frames)
+        return f"Reopened {p.name or fid} — {n} frame(s) ready for review."
+
     def _pipeline_generate_approved(self) -> None:
         """Loop through approved prompts generating each image DIRECTLY
         into the proper Post{N}/Frame{M}.png based on slide markers. No
@@ -4501,14 +4615,21 @@ class LotusPhase1:
             url = "/projects/" + rel
             fid = f"f{i+1}"
 
-            # RESUME CHECK — if the target file already exists (non-zero
-            # size, not a broken tmp), treat it as already-done.
+            # RESUME CHECK — only adopt an existing file as "already done"
+            # if its recorded prompt_text_hash matches the prompt we're
+            # about to render. Legacy frames (no provenance row) or stale
+            # frames from a different prompt re-render. Without this guard
+            # a fresh pipeline landing in a folder with prior FrameN.png
+            # files would silently inherit them and show the wrong content
+            # under the new prompts.
             already_done = False
             try:
-                already_done = (
-                    os.path.exists(target_path)
-                    and os.path.getsize(target_path) > 2048  # reject empty / half-writes
-                )
+                if (os.path.exists(target_path)
+                        and os.path.getsize(target_path) > 2048):
+                    recorded = lotus_pipelines_db.frame_provenance_hash(
+                        target_path)
+                    current = _prompt_text_hash(prompt["text"])
+                    already_done = bool(recorded) and (recorded == current)
             except Exception:
                 already_done = False
 
@@ -4596,6 +4717,13 @@ class LotusPhase1:
                     fr["final_url"]  = url2
                     fr["temp_url"]   = url2
                     fr["status"]     = "pending_review"
+                    try:
+                        lotus_pipelines_db.record_frame(
+                            path,
+                            _prompt_text_hash(fr.get("prompt_text", "")),
+                            pipeline_id=p.id, frame_id=fr.get("id"))
+                    except Exception as _pe:
+                        print(f"[pipeline] provenance record failed: {_pe}")
                     print(f"[pipeline] saved {fr['id']} → "
                           f"{section}/{os.path.basename(path)}")
                 else:
@@ -4631,6 +4759,13 @@ class LotusPhase1:
                     fr["status"]     = "pending_review"
                     fr["source"]     = "lotus"
                     fr["error"]      = None
+                    try:
+                        lotus_pipelines_db.record_frame(
+                            path,
+                            _prompt_text_hash(fr.get("prompt_text", "")),
+                            pipeline_id=p.id, frame_id=fr.get("id"))
+                    except Exception as _pe:
+                        print(f"[pipeline] provenance record failed: {_pe}")
                     print(f"[pipeline] saved {fr['id']} → "
                           f"{section}/{os.path.basename(path)}")
                     # Agent mesh: submit this freshly-saved frame to
@@ -4832,6 +4967,13 @@ class LotusPhase1:
         fr["temp_url"]   = fr["final_url"]
         fr["status"]     = "pending_review"
         fr["source"]     = "manual"
+        try:
+            lotus_pipelines_db.record_frame(
+                final_path,
+                _prompt_text_hash(fr.get("prompt_text", "")),
+                pipeline_id=p.id, frame_id=fr.get("id"))
+        except Exception as _pe:
+            print(f"[pipeline] provenance record failed: {_pe}")
         fr["error"]      = None
         print(f"[pipeline] {frame_id} uploaded by user → {final_path}")
 
@@ -5465,6 +5607,13 @@ class LotusPhase1:
             fr2["status"]     = "pending_review"
             fr2["source"]     = "lotus"
             fr2["error"]      = None
+            try:
+                lotus_pipelines_db.record_frame(
+                    saved,
+                    _prompt_text_hash(fr2.get("prompt_text", "")),
+                    pipeline_id=p.id, frame_id=fr2.get("id"))
+            except Exception as _pe:
+                print(f"[pipeline] provenance record failed: {_pe}")
             print(f"[pipeline] retry saved {frame_id} → {saved}")
             # Re-submit to ReviewAgent — the retry's output is subject to the
             # same text-fidelity check as the original render.
@@ -5579,6 +5728,13 @@ class LotusPhase1:
                 frame["final_url"] = "/projects/" + rel + cb
                 frame["temp_url"]  = "/projects/" + rel + cb
                 frame["status"]    = "pending_review"
+                try:
+                    lotus_pipelines_db.record_frame(
+                        path,
+                        _prompt_text_hash(frame.get("prompt_text", "")),
+                        pipeline_id=p.id, frame_id=frame.get("id"))
+                except Exception as _pe:
+                    print(f"[pipeline] provenance record failed: {_pe}")
             else:
                 frame["status"] = "failed"
             self._pipeline_broadcast()
@@ -5623,6 +5779,13 @@ class LotusPhase1:
                 root = os.path.expanduser(lotus_config.load()["image"].get("projects_root", "~/LotusAgent/Projects"))
                 rel = os.path.relpath(dst, root).replace(os.sep, "/")
                 approved[0]["final_url"] = "/projects/" + rel
+                try:
+                    lotus_pipelines_db.record_frame(
+                        dst,
+                        _prompt_text_hash(approved[0].get("prompt_text", "")),
+                        pipeline_id=p.id, frame_id=approved[0].get("id"))
+                except Exception as _pe:
+                    print(f"[pipeline] provenance record failed: {_pe}")
                 p.stage = "done"
                 self._pipeline_broadcast()
                 # Auto-rename the parent folder so this run is preserved
@@ -5645,6 +5808,13 @@ class LotusPhase1:
             fr["final_path"] = final_path
             rel = os.path.relpath(final_path, root).replace(os.sep, "/")
             fr["final_url"] = "/projects/" + rel
+            try:
+                lotus_pipelines_db.record_frame(
+                    final_path,
+                    _prompt_text_hash(fr.get("prompt_text", "")),
+                    pipeline_id=p.id, frame_id=fr.get("id"))
+            except Exception as _pe:
+                print(f"[pipeline] provenance record failed: {_pe}")
         p.stage = "done"
         self._pipeline_broadcast()
         # Auto-rename today's parent folder so this completed run is
@@ -5919,8 +6089,20 @@ class LotusPhase1:
         print("  Say 'exit' to quit")
         print("=" * 60 + "\n")
 
-        self.voice = VoiceEngine(tts_voice=TTS_VOICE)
-        self.voice.speak("LOTUS agent online. Say Lotus to wake me.")
+        try:
+            self.voice = VoiceEngine(tts_voice=TTS_VOICE)
+        except Exception as e:
+            # No microphone / no default input device (common on a Mac Studio
+            # with no built-in mic), or ambient calibration failed. Do NOT
+            # crash the process — the dashboard + WebSocket server are already
+            # running from __init__. Degrade to dashboard-only mode so the UI
+            # and content pipeline stay fully usable; only voice is disabled.
+            self._serve_dashboard_only(f"voice engine unavailable: {e}")
+            return
+        try:
+            self.voice.speak("LOTUS agent online. Say Lotus to wake me.")
+        except Exception:
+            pass
 
         import speech_recognition as sr
 
@@ -5968,10 +6150,16 @@ class LotusPhase1:
             return audio, (text or "").strip() or None
 
         # Open the mic once and loop forever inside the `with` block
-        with self.voice.microphone as mic_source:
-            self.voice.recognizer.adjust_for_ambient_noise(mic_source, duration=0.5)
-            print(f"✅  Stream open — energy threshold {self.voice.recognizer.energy_threshold:.0f}")
-            self._voice_main_loop(_read, mic_source, sr)
+        try:
+            with self.voice.microphone as mic_source:
+                self.voice.recognizer.adjust_for_ambient_noise(mic_source, duration=0.5)
+                print(f"✅  Stream open — energy threshold {self.voice.recognizer.energy_threshold:.0f}")
+                self._voice_main_loop(_read, mic_source, sr)
+        except (OSError, RuntimeError) as e:
+            # Mic vanished or couldn't be opened after init — same graceful
+            # degradation rather than taking the backend down.
+            self._serve_dashboard_only(f"microphone unavailable: {e}")
+            return
 
     def _voice_main_loop(self, read_fn, mic_source, sr) -> None:
         """Process phrases until KeyboardInterrupt. Extracted so run_voice's
@@ -6086,6 +6274,34 @@ class LotusPhase1:
             if alias in text_lower:
                 return alias
         return None
+
+    def _serve_dashboard_only(self, reason: str) -> None:
+        """Voice unavailable (e.g. no microphone / no default input device on a
+        Mac Studio) — keep the process alive in dashboard-only mode instead of
+        crashing. The dashboard + WebSocket server are already running from
+        __init__, so the UI and content pipeline stay fully usable; only voice
+        control is off. Exits cleanly on Ctrl-C / SIGTERM (Electron quit)."""
+        import time as _t
+        print(f"\n⚠️  Voice disabled — {reason}")
+        if not self.dashboard:
+            print("   Dashboard server isn't running either — nothing to "
+                  "serve. Exiting.")
+            return
+        print("   Continuing in dashboard-only mode — UI + content pipeline "
+              "fully available, voice control off.")
+        print("   📊 Dashboard: http://localhost:8766/dashboard.html")
+        try:
+            self._broadcast(type="controller_alert", ts=int(_t.time()),
+                            level="warn", agent="LOTUS",
+                            message=f"Voice disabled ({reason}). "
+                                    f"Dashboard-only mode.")
+        except Exception:
+            pass
+        try:
+            while True:
+                _t.sleep(3600)
+        except KeyboardInterrupt:
+            print("\n🔴 Agent offline.")
 
     def run_text(self):
         """Text-only mode for testing without mic."""
