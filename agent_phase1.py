@@ -1662,7 +1662,15 @@ class LotusPhase1:
 
     def _on_dashboard_pipeline(self, action: str, payload: dict) -> None:
         """Dashboard-driven pipeline control (approve/deny/regen/save)."""
-        print(f"[pipeline-msg] action={action!r} payload={payload}", flush=True)
+        # Never let a dead/broken stdout pipe abort dispatch. When the mother
+        # is orphaned (its Electron parent exited but the process survives and
+        # still serves :8765/:8766), a raw print here raises BrokenPipeError
+        # *before* the try below — which silently killed this daemon thread and
+        # dropped every dashboard action (approve/deny/save) with no feedback.
+        try:
+            print(f"[pipeline-msg] action={action!r} payload={payload}", flush=True)
+        except Exception:
+            pass
         try:
             if action == "set_source":
                 path = os.path.expanduser((payload.get("path") or "").strip())

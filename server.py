@@ -129,7 +129,17 @@ class DashboardServer:
         loop = asyncio.new_event_loop()
         self._loop = loop
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(self._ws_server())
+        try:
+            loop.run_until_complete(self._ws_server())
+        except OSError as e:
+            # EADDRINUSE: another (likely stale/orphaned) mother already owns
+            # this port. Fail LOUD — a silently-dead WS thread leaves the new
+            # mother half-started while the dashboard talks to the orphan,
+            # which is what made every dashboard action vanish with no error.
+            self._running = False
+            print(f"❌ WebSocket server could NOT bind ws://{self.bind}:{self.ws_port} — {e}\n"
+                  f"   Another LOTUS mother is probably already running. "
+                  f"Stop it (pkill -f 'lotus-mother') and relaunch.", flush=True)
 
     async def _ws_server(self) -> None:
         async def handler(websocket):
@@ -873,7 +883,16 @@ class DashboardServer:
             def log_message(self, format, *args):
                 pass  # suppress access log
 
-        server = HTTPServer((self.bind, self.http_port), Handler)
+        try:
+            server = HTTPServer((self.bind, self.http_port), Handler)
+        except OSError as e:
+            # EADDRINUSE — see _run_ws. Fail loud rather than die silently in
+            # this daemon thread (a stale/orphaned mother holds the port).
+            self._running = False
+            print(f"❌ HTTP/dashboard server could NOT bind http://{self.bind}:{self.http_port} — {e}\n"
+                  f"   Another LOTUS mother is probably already running. "
+                  f"Stop it (pkill -f 'lotus-mother') and relaunch.", flush=True)
+            return
         # Make the DashboardServer reachable from inside Handler via
         # `self.server.lotus` — used by /api/queue to call the live
         # snapshot callback the agent registered on us.

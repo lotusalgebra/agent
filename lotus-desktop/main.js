@@ -297,7 +297,21 @@ async function bootstrap() {
 
 // ── Lifecycle ───────────────────────────────────────────────────────────
 
-app.whenReady().then(() => { bootstrap(); });
+// Single-instance guard. A second launch must NOT spawn a second mother:
+// two mothers race for ports 8765/8766, the loser's servers die, and the new
+// window can bind to an orphaned mother whose dashboard actions no longer
+// work. Hand focus to the running instance and quit this one instead.
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (mainWin) {
+      if (mainWin.isMinimized()) mainWin.restore();
+      mainWin.focus();
+    }
+  });
+  app.whenReady().then(() => { bootstrap(); });
+}
 
 let quittingMother = false;
 
