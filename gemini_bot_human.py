@@ -581,6 +581,26 @@ async def _download_via_playwright_capture(save_to: str,
             # Mark the SCOPED Download button (in this image's bubble only)
             clicked = await img_loc.evaluate("""
                 (img) => {
+                    const mark = (b) => {
+                        const r = b.getBoundingClientRect();
+                        if (r.width < 1 || r.height < 1) return false;
+                        b.setAttribute('data-lotus-picked', '1');
+                        return true;
+                    };
+                    // PRIMARY (Gemini UI as of 2026-06): explicit full-res
+                    // download button inside this image's <generated-image>.
+                    // Replaced the old hover "Download" button; missing it leaks
+                    // a native Chrome download + Save-As prompt.
+                    let gi = img;
+                    while (gi && gi.tagName !== 'GENERATED-IMAGE') gi = gi.parentElement;
+                    if (gi) {
+                        const explicit = gi.querySelector(
+                            'download-generated-image-button button, ' +
+                            'button[aria-label=\"Download full-sized image\"]'
+                        );
+                        if (explicit && mark(explicit)) return true;
+                    }
+                    // FALLBACK (legacy/other UI): walk up for a Download-ish label.
                     const isDl = (el) => {
                         const a = (el.getAttribute('aria-label')||'').toLowerCase();
                         const d = (el.getAttribute('data-test-id')||'').toLowerCase();
@@ -595,10 +615,7 @@ async def _download_via_playwright_capture(save_to: str,
                         if (!node) break;
                         for (const b of node.querySelectorAll('button, [role=\"button\"]')) {
                             if (!isDl(b)) continue;
-                            const r = b.getBoundingClientRect();
-                            if (r.width < 1 || r.height < 1) continue;
-                            b.setAttribute('data-lotus-picked', '1');
-                            return true;
+                            if (mark(b)) return true;
                         }
                     }
                     return false;

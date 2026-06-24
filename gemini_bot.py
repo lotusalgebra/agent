@@ -398,6 +398,37 @@ async def _wait_for_image_element(page, timeout_s: float = 240.0, verbose: bool 
     return None
 
 
+import lotus_imgutil
+
+
+def _accept_fullres(save_path, label: str, verbose: bool) -> bool:
+    """A file has just been written to save_path. Accept it only if it's a
+    real full-resolution asset; otherwise delete it and return False so the
+    download cascade falls through to the next strategy. Centralises the
+    preview-vs-fullres guard that every download tier shares. Resolution is
+    judged by `lotus_imgutil` (format-agnostic — handles PNG and JPEG), so a
+    downscaled preview is rejected no matter which format Gemini served."""
+    try:
+        edge = lotus_imgutil.long_edge(save_path)
+    except Exception:
+        edge = 0
+    if edge >= lotus_imgutil.MIN_FULLRES_LONG_EDGE:
+        if verbose:
+            size = save_path.stat().st_size
+            print(f"[bot] {label} → {save_path} "
+                  f"({edge}px long edge, {size // 1024} KB)")
+        return True
+    # Low-res preview (or unreadable) — discard so we don't ship a thumbnail.
+    try:
+        save_path.unlink()
+    except Exception:
+        pass
+    if verbose:
+        print(f"[bot] {label} returned low-res preview "
+              f"({edge}px long edge) — rejecting, will try next strategy")
+    return False
+
+
 async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> Optional[str]:
     """Save the rendered image to disk.
 
@@ -458,6 +489,31 @@ async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> 
         # Download-ish aria-label — on each ancestor level.
         clicked = await img_loc.evaluate("""
             (img) => {
+                const mark = (b) => {
+                    const r = b.getBoundingClientRect();
+                    if (r.width < 1 || r.height < 1) return false;
+                    b.setAttribute('data-lotus-picked', '1');
+                    return true;
+                };
+                // PRIMARY (Gemini UI as of 2026-06): the full-res download is an
+                // explicit <download-generated-image-button> inside this image's
+                // <generated-image> host. aria-label is "Download full-sized
+                // image". This replaced the old hover "Download" button; the
+                // legacy fuzzy walk-up below no longer reliably matches it, and
+                // when it misses, the click leaks to a NATIVE Chrome download
+                // (Gemini_Generated_Image_*.png) + a Save-As prompt. Target the
+                // element explicitly and let expect_download capture it.
+                let gi = img;
+                while (gi && gi.tagName !== 'GENERATED-IMAGE') gi = gi.parentElement;
+                if (gi) {
+                    const explicit = gi.querySelector(
+                        'download-generated-image-button button, ' +
+                        'button[aria-label="Download full-sized image"]'
+                    );
+                    if (explicit && mark(explicit)) return true;
+                }
+                // FALLBACK (legacy/other UI): walk up from the <img> looking for
+                // a Download-ish aria-label on each ancestor level.
                 const isDl = (el) => {
                     const a = (el.getAttribute('aria-label')||'').toLowerCase();
                     const d = (el.getAttribute('data-test-id')||'').toLowerCase();
@@ -475,11 +531,7 @@ async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> 
                     );
                     for (const b of btns) {
                         if (!isDl(b)) continue;
-                        const r = b.getBoundingClientRect();
-                        if (r.width < 1 || r.height < 1) continue;
-                        // Mark it so the Python side can see we matched.
-                        b.setAttribute('data-lotus-picked', '1');
-                        return true;
+                        if (mark(b)) return true;
                     }
                 }
                 return false;
@@ -512,16 +564,8 @@ async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> 
             dl = await dl_info.value
             tmp = await dl.path()
             shutil.move(str(tmp), str(save_path))
-            size = save_path.stat().st_size
-            if size > 2048:
-                if verbose:
-                    print(f"[bot] downloaded via scoped button → {save_path} "
-                          f"({size//1024} KB)")
+            if _accept_fullres(save_path, "downloaded via scoped button", verbose):
                 return str(save_path)
-            try: save_path.unlink()
-            except Exception: pass
-            if verbose:
-                print(f"[bot] scoped download returned tiny file ({size}b) — falling back")
         else:
             if verbose:
                 print("[bot] no Download button found within this image's bubble — falling back")
@@ -552,26 +596,20 @@ async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> 
             resp = await ctx.request.get(full_src, timeout=45_000)
             if resp.ok:
                 body = await resp.body()
-                if body and len(body) > 2048:
+                if body:
                     save_path.write_bytes(body)
-                    if verbose:
-                        print(f"[bot] request-context fetched → {save_path} "
-                              f"({len(body)//1024} KB)")
-                    return str(save_path)
-                if verbose:
-                    print(f"[bot] request-context got tiny body ({len(body or b'')}b)"
-                          f" — retrying with raw src")
-                # Try again without the size suffix (some URLs reject =s0).
+                    if _accept_fullres(save_path, "request-context fetched", verbose):
+                        return str(save_path)
+                # =s0 gave a preview/empty body — retry without the size suffix
+                # (some URLs reject =s0).
                 if full_src != src:
                     resp = await ctx.request.get(src, timeout=30_000)
                     if resp.ok:
                         body = await resp.body()
-                        if body and len(body) > 2048:
+                        if body:
                             save_path.write_bytes(body)
-                            if verbose:
-                                print(f"[bot] request-context (raw) → {save_path} "
-                                      f"({len(body)//1024} KB)")
-                            return str(save_path)
+                            if _accept_fullres(save_path, "request-context (raw)", verbose):
+                                return str(save_path)
             else:
                 if verbose:
                     print(f"[bot] request-context status {resp.status}")
@@ -588,10 +626,8 @@ async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> 
                 try:
                     _, b64 = src.split(",", 1)
                     save_path.write_bytes(base64.b64decode(b64))
-                    if verbose:
-                        print(f"[bot] saved data-URL → {save_path} "
-                              f"({save_path.stat().st_size//1024} KB)")
-                    return str(save_path)
+                    if _accept_fullres(save_path, "saved data-URL", verbose):
+                        return str(save_path)
                 except Exception as e:
                     if verbose: print(f"[bot] data: parse failed: {e}")
             if src.startswith("blob:") or src.startswith("http"):
@@ -609,16 +645,8 @@ async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> 
                     import base64
                     if b64:
                         save_path.write_bytes(base64.b64decode(b64))
-                        size = save_path.stat().st_size
-                        if size > 2048:
-                            if verbose:
-                                print(f"[bot] fetched src → {save_path} "
-                                      f"({size//1024} KB)")
+                        if _accept_fullres(save_path, "fetched src", verbose):
                             return str(save_path)
-                        try: save_path.unlink()
-                        except Exception: pass
-                        if verbose:
-                            print(f"[bot] src fetch returned tiny file ({size}b)")
                 except Exception as e:
                     if verbose: print(f"[bot] src-fetch path failed: {e}")
     except Exception as e:
@@ -646,15 +674,13 @@ async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> 
             import base64
             _, b64 = data_url.split(",", 1)
             save_path.write_bytes(base64.b64decode(b64))
-            size = save_path.stat().st_size
-            if size > 2048:
-                if verbose:
-                    print(f"[bot] canvas-capture → {save_path} ({size//1024} KB)")
+            # Canvas capture reads the *displayed* bitmap (img.naturalWidth),
+            # which is the downscaled preview unless Gemini rendered full-res
+            # inline — so this almost always fails the full-res gate. That's
+            # intended: a ~1024px capture is exactly the low-res junk we refuse
+            # to ship (it was the source of the 1024x765 "saved" frames).
+            if _accept_fullres(save_path, "canvas-capture", verbose):
                 return str(save_path)
-            try: save_path.unlink()
-            except Exception: pass
-            if verbose:
-                print(f"[bot] canvas-capture returned tiny file ({size}b)")
         elif isinstance(data_url, str) and data_url.startswith("ERR:"):
             if verbose: print(f"[bot] canvas-capture rejected: {data_url[4:]}")
     except Exception as e:

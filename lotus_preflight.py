@@ -161,6 +161,46 @@ def _clear_singleton_locks(profile_dir: Path) -> None:
             pass  # if Chrome itself is using it, launch will surface the error
 
 
+def _ensure_download_prefs(profile_dir: Path) -> None:
+    """Stopgap safety net: force the CDP Chrome profile to auto-save downloads
+    without ever showing a native "Save As" dialog, into a single known staging
+    folder.
+
+    The image bots capture downloads via Playwright's expect_download, so a
+    correctly-captured frame never reaches Chrome's native download handler.
+    But if a click ever leaks (e.g. a Gemini UI change moves the download
+    control again), Chrome falls back to its own handler — and with the
+    profile's default settings that pops a Save-As prompt and dumps the file
+    into the last-used folder. Pinning prompt_for_download=false + a fixed
+    default_directory means any leaked download lands silently in
+    ~/.lotus_auth/download_staging instead of blocking the pipeline on a modal.
+
+    Written pre-launch (the profile isn't locked yet). No-op + never raises if
+    anything goes wrong — a stopgap must not break startup. Only affects Chrome
+    instances we launch; a reused live session keeps its current settings.
+    """
+    try:
+        import json
+        staging = profile_dir.parent / "download_staging"
+        staging.mkdir(parents=True, exist_ok=True)
+        prefs_path = profile_dir / "Default" / "Preferences"
+        prefs: dict = {}
+        if prefs_path.exists():
+            try:
+                prefs = json.loads(prefs_path.read_text(encoding="utf-8"))
+            except Exception:
+                prefs = {}
+        dl = prefs.setdefault("download", {})
+        dl["prompt_for_download"] = False
+        dl["default_directory"] = str(staging)
+        dl["directory_upgrade"] = True
+        prefs.setdefault("savefile", {})["default_directory"] = str(staging)
+        prefs_path.parent.mkdir(parents=True, exist_ok=True)
+        prefs_path.write_text(json.dumps(prefs), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def launch_chrome(profile_dir: Path = DEFAULT_PROFILE_DIR,
                   port: int = DEFAULT_CDP_PORT,
                   start_url: str = GEMINI_START_URL) -> subprocess.Popen:
@@ -170,6 +210,7 @@ def launch_chrome(profile_dir: Path = DEFAULT_PROFILE_DIR,
     detects the live CDP and reuses it.
     """
     profile_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_download_prefs(profile_dir)
     _clear_singleton_locks(profile_dir)
     chrome = _find_chrome()
     args = [
