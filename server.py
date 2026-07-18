@@ -782,9 +782,9 @@ class DashboardServer:
                         # overview can show approved/pending/rejected at a
                         # glance without a second round-trip per card.
                         for r in rows:
-                            sh = r.get("source_hash")
+                            pid = r.get("id")
                             r["prompt_counts"] = (
-                                _prdb.count_by_status(sh) if sh
+                                _prdb.count_by_status(pid) if pid
                                 else {"pending": 0, "approved": 0, "rejected": 0}
                             )
                             r["source_basename"] = (

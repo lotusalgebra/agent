@@ -3737,7 +3737,7 @@ class LotusPhase1:
                 # the review-gate DB so the UI has something to show.
                 if p.source_hash:
                     try:
-                        rs = lotus_prompts_db.list_for_source(p.source_hash)
+                        rs = lotus_prompts_db.list_for_pipeline(p.id)
                         p.prompts = [
                             {
                                 "id":           str(r["id"]),
@@ -4179,16 +4179,18 @@ class LotusPhase1:
         print(f"[pipeline] Gemma extracted {len(normalised)} prompt(s) "
               f"from {os.path.basename(path)}")
 
-        # Persist to the prompts DB. UNIQUE on (source_hash, text_hash) so a
-        # second upload of the same file dedupes against the existing rows
-        # (preserving any prior approve/reject/edit state).
+        # Persist to the prompts DB. UNIQUE on (pipeline_id, text_hash) so a
+        # second upload of the same file INTO THIS PIPELINE dedupes against
+        # its existing rows (preserving prior approve/reject/edit state).
         source_hash = lotus_prompts_db.file_hash(path)
-        rows = lotus_prompts_db.add_batch(path, source_hash, normalised)
-        print(f"[pipeline] DB now has {len(rows)} prompt(s) for this source "
-              f"(hash={source_hash[:12]})")
-
         p.source_md = path
         p.source_hash = source_hash
+        # Prompts are owned by THIS pipeline (one-to-many): keying on p.id
+        # means a second pipeline built from the same file gets its own
+        # independent rows and review state — no cross-pipeline bleed.
+        rows = lotus_prompts_db.add_batch(path, source_hash, p.id, normalised)
+        print(f"[pipeline] DB now has {len(rows)} prompt(s) for pipeline "
+              f"{p.id} (source hash={source_hash[:12]})")
         p.prompts = [
             {
                 "id":           str(r["id"]),
@@ -4204,7 +4206,7 @@ class LotusPhase1:
         ]
         p.stage = "review_prompts"
         self._pipeline_broadcast()
-        counts = lotus_prompts_db.count_by_status(source_hash)
+        counts = lotus_prompts_db.count_by_status(p.id)
         return True, (f"Loaded {len(rows)} prompts from "
                       f"{os.path.basename(path)} "
                       f"(approved={counts['approved']}, "
@@ -4237,17 +4239,12 @@ class LotusPhase1:
             if item["status"] == "pending":
                 item["status"] = "approved"
         # Mirror to DB — only flip rows that are still pending so a
-        # previously-rejected prompt isn't silently re-approved.
-        if p.source_hash:
-            try:
-                with lotus_prompts_db._lock, lotus_prompts_db._conn() as c:
-                    c.execute(
-                        "UPDATE prompts SET status='approved', "
-                        "updated_at=? WHERE source_hash=? AND status='pending'",
-                        (datetime.utcnow().isoformat(), p.source_hash),
-                    )
-            except Exception as e:
-                print(f"[prompts-db] approve_all: {e}", flush=True)
+        # previously-rejected prompt isn't silently re-approved. Scoped to
+        # this pipeline's rows (one-to-many), never the whole source file.
+        try:
+            lotus_prompts_db.approve_pending(p.id)
+        except Exception as e:
+            print(f"[prompts-db] approve_all: {e}", flush=True)
         self._pipeline_broadcast()
 
     def _pipeline_approve_subset_and_run(self, prompt_ids: list,
@@ -4472,7 +4469,7 @@ class LotusPhase1:
         # Prompts from the review-gate DB (same shape as rehydrate).
         if p.source_hash:
             try:
-                rs = lotus_prompts_db.list_for_source(p.source_hash)
+                rs = lotus_prompts_db.list_for_pipeline(p.id)
                 p.prompts = [
                     {
                         "id":           str(r["id"]),
