@@ -65,6 +65,8 @@ _NEW_SCHEMA = """
         topic_number  INTEGER,
         slide_number  INTEGER,
         source_type   TEXT,
+        kind          TEXT NOT NULL DEFAULT 'image',
+        act_number    INTEGER,
         text          TEXT NOT NULL,
         text_hash     TEXT NOT NULL,
         edited_text   TEXT,
@@ -173,10 +175,35 @@ def _migrate_to_pipeline_id(c: sqlite3.Connection) -> None:
           f"prompts_pre_pipeline_id_backup.")
 
 
+def _add_missing_columns(c: sqlite3.Connection) -> None:
+    """Additive column migration for DBs created before the cinematic
+    storyboard work. `CREATE TABLE IF NOT EXISTS` is a no-op on an existing
+    table, so new columns have to be ALTERed in explicitly.
+
+    Deliberately additive-only — no table rebuild, so existing approve /
+    reject / edit state is untouched. Legacy rows default to kind='image',
+    which is what they all were.
+    """
+    cols = _table_columns(c, "prompts")
+    if not cols:
+        return  # fresh DB — _NEW_SCHEMA creates the columns directly
+    for name, ddl in (
+        ("kind",       "ALTER TABLE prompts ADD COLUMN kind TEXT NOT NULL DEFAULT 'image'"),
+        ("act_number", "ALTER TABLE prompts ADD COLUMN act_number INTEGER"),
+    ):
+        if name not in cols:
+            try:
+                c.execute(ddl)
+                print(f"[prompts-db] added column {name}")
+            except Exception as e:
+                print(f"[prompts-db] could not add column {name}: {e}")
+
+
 def _init() -> None:
     with _lock, _conn() as c:
         _migrate_to_pipeline_id(c)
         c.executescript(_NEW_SCHEMA)
+        _add_missing_columns(c)
 
 
 _init()
@@ -222,6 +249,8 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
         "topic_number":  row["topic_number"],
         "slide_number":  row["slide_number"],
         "source_type":   row["source_type"],
+        "kind":          (row["kind"] if "kind" in row.keys() else "image"),
+        "act_number":    (row["act_number"] if "act_number" in row.keys() else None),
         "text":          row["text"],
         "edited_text":   row["edited_text"],
         "status":        row["status"],
@@ -256,6 +285,8 @@ def add_batch(source_path: str, source_hash: str, pipeline_id: str,
             pipeline_id, source_path, source_hash,
             title, topic_n, slide_n,
             cand.get("source") or "",
+            cand.get("kind") or "image",
+            cand.get("act"),
             text, text_hash(text),
             "pending",
             now, now,
@@ -266,9 +297,9 @@ def add_batch(source_path: str, source_hash: str, pipeline_id: str,
                 """
                 INSERT OR IGNORE INTO prompts
                 (pipeline_id, source_path, source_hash, slide_title,
-                 topic_number, slide_number, source_type, text, text_hash,
-                 status, created_at, updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                 topic_number, slide_number, source_type, kind, act_number,
+                 text, text_hash, status, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 rows,
             )
@@ -355,23 +386,37 @@ def count_by_status(pipeline_id: str) -> dict[str, int]:
         return out
 
 
-def approved_text_for(pipeline_id: str) -> list[dict]:
+def approved_text_for(pipeline_id: str,
+                      kinds: Optional[Iterable[str]] = None) -> list[dict]:
     """Return the list the generation step should burst-send. Each item:
-       {id, slide_title, topic_number, slide_number, text}
+       {id, slide_title, topic_number, slide_number, kind, act_number, text}
     where 'text' is edited_text if the user edited the prompt, else the
     original parsed text. Ordered by topic/slide for stable post grouping.
+
+    `kinds` defaults to everything EXCEPT 'motion'. That default is load-
+    bearing: motion prompts describe how a shot moves and would be rendered
+    as stills by the image chain if they leaked into it. The video stage
+    asks for them explicitly with kinds=('motion',).
     """
+    if kinds is None:
+        where, params = "kind != 'motion'", [pipeline_id]
+    else:
+        kinds = list(kinds)
+        if not kinds:
+            return []
+        where = f"kind IN ({','.join('?' * len(kinds))})"
+        params = [pipeline_id] + kinds
     rows = []
     with _lock, _conn() as c:
         cur = c.execute(
             f"""
             SELECT id, slide_title, topic_number, slide_number,
-                   text, edited_text
+                   kind, act_number, text, edited_text
               FROM prompts
-             WHERE pipeline_id=? AND status='approved'
+             WHERE pipeline_id=? AND status='approved' AND {where}
              {_ORDER_BY}
             """,
-            (pipeline_id,),
+            params,
         )
         for r in cur.fetchall():
             rows.append({
@@ -379,6 +424,8 @@ def approved_text_for(pipeline_id: str) -> list[dict]:
                 "slide_title":  r["slide_title"],
                 "topic_number": r["topic_number"],
                 "slide_number": r["slide_number"],
+                "kind":         r["kind"],
+                "act_number":   r["act_number"],
                 "text":         r["edited_text"] or r["text"],
             })
     return rows

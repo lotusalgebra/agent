@@ -107,6 +107,56 @@ def _code_block_title_looks_prompty(title: str) -> bool:
     return bool(_CODEBLOCK_PROMPT_TITLE_RE.search(title or ""))
 
 
+# ── Cinematic storyboard kinds (see CINEMATIC_FORMAT.md) ──────────────────
+#
+# A cinematic pack carries three kinds of block under PROMPT-bearing
+# headings, and they must NOT all reach the image generator:
+#
+#   asset   — character / location / prop reference sheets. Rendered FIRST
+#             so every later keyframe can re-describe the same subject and
+#             stay visually consistent (NB2 has no memory between calls).
+#   image   — the keyframe still for an act. Also every legacy SLIDE/STORY.
+#   motion  — the ACT PROMPT: how the shot moves. Goes to Google Flow as
+#             image→video, using that act's APPROVED keyframe as the source
+#             image, so the clip matches the board the user signed off on.
+#
+# Motion blocks used to be discarded outright by a `"stitching" in title or
+# text[:120]` filter, because the only consumer downstream was image
+# generation. That filter was also a latent bug: a legitimate image prompt
+# opening with the word "stitching" (leather, embroidery, couture — all
+# common in this corpus) was silently dropped. Classifying by HEADING is
+# both what the cinematic format needs and strictly more precise.
+_MOTION_TITLE_RE = re.compile(
+    r"\b(ACT\s+PROMPT|MOTION\s+PROMPT|VIDEO\s+PROMPT|STITCHING)\b",
+    re.IGNORECASE,
+)
+_ASSET_TITLE_RE = re.compile(r"\bASSET\b", re.IGNORECASE)
+_ACT_NUM_RE = re.compile(r"\bACT\s*0*(\d+)", re.IGNORECASE)
+
+
+def classify_kind(title: str, text: str = "") -> str:
+    """'asset' | 'image' | 'motion' for one candidate, from its heading path.
+
+    Falls back to a body check for the literal phrase "stitching prompt"
+    (not the bare word) to keep recognising legacy REEL packs that put the
+    label in the block body rather than the heading.
+    """
+    t = title or ""
+    if _MOTION_TITLE_RE.search(t):
+        return "motion"
+    if "stitching prompt" in (text or "")[:160].lower():
+        return "motion"
+    if _ASSET_TITLE_RE.search(t):
+        return "asset"
+    return "image"
+
+
+def act_number(title: str) -> Optional[int]:
+    """Act number from a heading path ('… · ACT 3 — Reveal · …' -> 3)."""
+    m = _ACT_NUM_RE.search(title or "")
+    return int(m.group(1)) if m else None
+
+
 def _is_divider_heading(text: str) -> bool:
     """Treat heading lines that are visually dividers (mostly ASCII art —
     e.g. `# ================================================================`
@@ -161,15 +211,22 @@ def _split_story_section(cand: dict) -> list:
     return out if out else [cand]
 
 
-def extract_candidates(md_text: str) -> list:
+def extract_candidates(md_text: str, include_motion: bool = False) -> list:
     """Walk the markdown AST and return a list of prompt-CANDIDATE dicts.
 
     Each candidate has:
       - 'title':   heading text above the content (or '' if from a code block)
       - 'text':    the raw content chunk (may include preamble, labels, etc.)
       - 'source':  where it came from ('section'|'code_block'|'label')
+      - 'kind':    'asset' | 'image' | 'motion'  (see classify_kind)
+      - 'act':     act number when the heading path names one, else None
 
     These candidates then go to Gemma for validation / cleanup.
+
+    `include_motion` defaults to False so every existing caller keeps the
+    historical behaviour of never seeing video/motion prompts — those would
+    be rendered as PNGs by the image chain. The cinematic path opts in via
+    `extract_storyboard()`.
     """
     # Strip YAML frontmatter if present so mistune doesn't choke
     if frontmatter is not None:
@@ -311,13 +368,16 @@ def extract_candidates(md_text: str) -> list:
             expanded.append(c)
     candidates = expanded
 
-    # Drop video-stitching prompts. REEL packs include `## ACT N — GROK
-    # STITCHING PROMPT` blocks alongside the per-keyframe NB2 prompts; the
-    # stitching ones are instructions for Grok's image-to-video stage and
-    # must NOT enter the image-generation pipeline.
-    candidates = [c for c in candidates
-                  if "stitching" not in (c.get("title") or "").lower()
-                  and "stitching" not in (c.get("text") or "")[:120].lower()]
+    # Tag every candidate with its kind + act number. Motion prompts (ACT
+    # PROMPT / legacy GROK STITCHING PROMPT) describe how a shot MOVES —
+    # they're instructions for the image→video stage and must never enter
+    # the image-generation pipeline, so they're withheld unless the caller
+    # explicitly asks for them.
+    for c in candidates:
+        c["kind"] = classify_kind(c.get("title") or "", c.get("text") or "")
+        c["act"] = act_number(c.get("title") or "")
+    if not include_motion:
+        candidates = [c for c in candidates if c["kind"] != "motion"]
 
     # Smart de-dup: prefer 'label' candidates (just the prompt body) over
     # 'box_section' / 'section' candidates (whole slide with surrounding
@@ -490,6 +550,34 @@ def extract_prompts(md_text: str,
         if cleaned:
             results.append(cleaned)
     return results
+
+
+def is_cinematic(md_text: str) -> bool:
+    """True when the document uses the cinematic storyboard format — i.e. it
+    has at least one motion prompt to hand to Flow. Files without one are
+    ordinary image packs and take the existing path unchanged."""
+    return any(c["kind"] == "motion"
+               for c in extract_candidates(md_text, include_motion=True))
+
+
+def extract_storyboard(md_text: str) -> dict:
+    """Cinematic split of one document (see CINEMATIC_FORMAT.md).
+
+    Returns {'assets': [...], 'keyframes': [...], 'motion': [...]} of raw
+    candidate dicts — no Gemma. Render order is assets → keyframes → motion:
+    assets first so keyframes can reference a rendered sheet, motion last
+    because it costs Flow credits and needs an APPROVED keyframe to animate.
+
+    Motion candidates carry 'act', which is how the video stage finds the
+    keyframe to use as its source image. A motion prompt whose heading names
+    no act can't be paired with a still and will fall back to text→video.
+    """
+    cands = extract_candidates(md_text, include_motion=True)
+    out = {"assets": [], "keyframes": [], "motion": []}
+    bucket = {"asset": "assets", "image": "keyframes", "motion": "motion"}
+    for c in cands:
+        out[bucket[c["kind"]]].append(c)
+    return out
 
 
 if __name__ == "__main__":
