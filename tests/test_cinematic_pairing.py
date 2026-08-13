@@ -124,8 +124,60 @@ def main():
     ok &= run_case("legacy pack — unchanged text->video", legacy, [],
                    [("Clip1.mp4", None), ("Clip2.mp4", None)])
 
+    ok &= handoff_cases()
     print("\n" + ("ALL PASS" if ok else "FAILURES PRESENT"))
     return 0 if ok else 1
+
+
+# ── step 5: boards -> clips handoff ──────────────────────────────────────
+
+def handoff_cases():
+    """_maybe_start_clips must fire exactly once, and only when the film
+    has approved motion prompts AND rendered boards. Credits are on the
+    line, so the negative cases matter more than the positive one."""
+    import tempfile as _tf
+    started = []
+    results = []
+    if True:
+        def case(name, cinematic, prompts, frames, expect_start, phase="boards"):
+            del started[:]
+            tmp = _tf.mkdtemp()
+            for fr in frames:
+                if fr.get("_make_file"):
+                    os.makedirs(os.path.dirname(fr["final_path"]), exist_ok=True)
+                    open(fr["final_path"], "wb").write(b"\0" * 8192)
+            p = FakePipeline(tmp, prompts, frames)
+            p.cinematic = cinematic
+            p.phase = phase
+            agent = FakeAgent(p)
+            # Stub the generator on the instance — the handoff should hand
+            # off, not actually render.
+            agent._pipeline_generate_approved_video = lambda: started.append(True)
+            fired = ap.LotusPhase1._maybe_start_clips.__get__(agent)()
+            import time
+            time.sleep(0.2)
+            got = bool(started)
+            good = (got == expect_start) and (fired == expect_start)
+            print(f"  {'PASS' if good else 'FAIL'}  {name}: "
+                  f"started={got} expected={expect_start} phase_now={p.phase!r}")
+            results.append(good)
+
+        tmp = _tf.mkdtemp()
+        motion_ok = [
+            {"id": "1", "status": "approved", "kind": "image",  "act_number": 1, "text": "kf"},
+            {"id": "2", "status": "approved", "kind": "motion", "act_number": 1, "text": "move"},
+        ]
+        board = [kf("f1", "1", tmp, 1)]
+
+        print("\n=== boards -> clips handoff ===")
+        case("film with approved motion + rendered board", True, motion_ok, board, True)
+        case("ordinary image pack (not cinematic)", False, motion_ok, board, False)
+        case("already in clips phase (idempotent)", True, motion_ok, board, False,
+             phase="clips")
+        case("motion prompt REJECTED at review", True,
+             [motion_ok[0], {**motion_ok[1], "status": "rejected"}], board, False)
+        case("no board rendered — refuses to burn credits", True, motion_ok, [], False)
+    return all(results)
 
 
 if __name__ == "__main__":

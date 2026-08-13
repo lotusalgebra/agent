@@ -38,7 +38,7 @@ hiddenimports = [
     # happens inside a method body or `__init__`.
     "agents", "auth", "blender", "browser", "enroll",
     "gemini", "gemini_api", "gemini_bot", "gemini_bot_human", "flow_bot",
-    "grok_bot", "grok_video",
+    "flow_video", "grok_bot", "grok_video",
     "lotus_config", "lotus_file_classifier", "lotus_history",
     "lotus_mdns", "lotus_pipelines_db", "lotus_preflight",
     "lotus_prompts_db", "lotus_recorder",

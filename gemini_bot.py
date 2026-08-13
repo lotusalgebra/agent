@@ -28,12 +28,28 @@ from pathlib import Path
 from typing import Optional
 
 _PROFILE_DIR = Path(os.path.expanduser("~/.lotus_auth/chrome_profile"))
-GEMINI_URL = "https://gemini.google.com/app"
+def _authuser() -> int:
+    """Google account index for this profile (see lotus_config.google_authuser).
+    Read at import; change the config and restart to switch accounts."""
+    try:
+        import lotus_config
+        return lotus_config.google_authuser()
+    except Exception:
+        return 0
+
+
+# Account-pinned Gemini URL. The bare /app path resolves to whichever account
+# signed in first, which may not be the one holding the paid plan.
+GEMINI_URL = f"https://gemini.google.com/u/{_authuser()}/app"
 
 # JS expression → true iff a REAL, visible "Stop generating" button is
 # present. We deliberately avoid `aria-label*="Stop"` because that fuzzy
 # match also hits "More options for <prompt>" buttons on previous chat
 # bubbles whenever an old prompt contained the word "stop".
+# Seconds a Stop button may stay "stuck" before we treat the chat as wedged
+# and bail to a fresh chat (instead of re-clicking Stop for the full deadline).
+_WEDGED_CHAT_SEC = 40.0
+
 _JS_STOP_BTN_PRESENT = """
     (() => Array.from(document.querySelectorAll(
         'button[aria-label], button[data-testid]'
@@ -482,6 +498,38 @@ async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> 
                 await img_loc.hover(timeout=8000)
             except Exception: pass
         await page.wait_for_timeout(900)
+
+        # PRIMARY (validated live 2026-06-27): click the explicit full-res
+        # download button via a real Playwright locator SCOPED to THIS image's
+        # <generated-image> host. A clean .click() auto-waits for visibility +
+        # actionability and reliably fires the CDP download event. The legacy
+        # JS-mark path below instead marks the button via getBoundingClientRect
+        # then does a force=True click — force bypasses actionability, so a
+        # transient hover/tooltip overlay swallowed the click and the download
+        # leaked to a NATIVE Save-As with no download event (the regression
+        # this repairs). Keep the legacy walk-up as a fallback for older/other
+        # Gemini UIs that don't use <generated-image>.
+        try:
+            scoped_dl = (img_loc
+                .locator("xpath=ancestor-or-self::generated-image[1]")
+                .locator('download-generated-image-button button, '
+                         'button[aria-label="Download full-sized image"]')
+                .first)
+            if await scoped_dl.count():
+                try:
+                    await scoped_dl.scroll_into_view_if_needed(timeout=4000)
+                except Exception:
+                    pass
+                async with page.expect_download(timeout=60_000) as dl_info:
+                    await scoped_dl.click(timeout=15_000)
+                dl = await dl_info.value
+                tmp = await dl.path()
+                shutil.move(str(tmp), str(save_path))
+                if _accept_fullres(save_path, "downloaded via scoped button", verbose):
+                    return str(save_path)
+        except Exception as e:
+            if verbose:
+                print(f"[bot] scoped-locator download failed: {e} — trying legacy path")
 
         # Resolve the Download button that is inside the same bubble as
         # this exact img element. We use a JS path that walks up the DOM
@@ -1169,93 +1217,116 @@ async def _enable_thinking_mode(page, verbose: bool = False,
 
 
 async def _select_create_image_tool(page, verbose: bool = False) -> bool:
-    """Enable Gemini's "Create image" tool for the current conversation.
+    """ALWAYS enable Gemini's "Create image" tool for the current conversation.
 
-    UI shape (verified 2026-05-19):
-      • the `+` button next to the prompt input has aria-label="Upload and tools"
-      • clicking it opens a menu whose tool toggles are
-        `<button role="menuitemcheckbox">` with empty aria-label —
-        match by textContent only ("Create image", "Create video", …)
-      • the item carries aria-checked="true|false"; clicking flips it,
-        so we must skip the click if it's already enabled
-    Returns True on success (enabled or already on), False otherwise. Never raises.
+    Gemini moved image generation into the "Upload and tools" (`+`) menu —
+    without selecting it, Gemini replies with a TEXT description instead of an
+    image. This runs a retry loop that, on EACH attempt:
+      1. dismisses any modal / popup window that opened over the composer
+         (feature announcements, banners, or a leftover-open menu),
+      2. opens the "Upload and tools" menu (aria-label prefix "upload and tools"),
+      3. clicks the "Create image" item (role menuitem/checkbox/option, matched
+         by text; skips the click if it's already checked),
+      4. re-opens the menu to VERIFY "Create image" ended up checked.
+
+    Returns True only once the tool is confirmed selected (or already on).
+    Never raises.
     """
-    try:
-        await _dismiss_modals(page, verbose=False)
-    except Exception:
-        pass
-
-    try:
-        opened = await page.evaluate("""
-            () => {
-                const b = Array.from(document.querySelectorAll('button, [role="button"]'))
-                    .find(e => {
-                        const a = (e.getAttribute('aria-label') || '').toLowerCase().trim();
-                        // Prefix match — Gemini may append state to the label
-                        // (as it did to the mode picker), so avoid exact equality.
-                        if (!a.startsWith('upload and tools')) return false;
-                        const r = e.getBoundingClientRect();
-                        return r.width > 0 && r.height > 0;
-                    });
-                if (!b) return {opened: false};
-                b.click();
-                return {opened: true};
-            }
-        """)
-    except Exception as e:
-        if verbose: print(f"[bot] create-image picker err: {e}")
-        opened = {"opened": False}
-
-    if not opened or not opened.get("opened"):
-        if verbose: print("[bot] create-image: 'Upload and tools' button not found")
-        return False
-    if verbose:
-        print("[bot] create-image: opened 'Upload and tools' menu")
-
-    await page.wait_for_timeout(500)
-
-    try:
-        pick = await page.evaluate("""
-            () => {
-                const items = Array.from(document.querySelectorAll(
-                    '[role="menuitemcheckbox"], [role="menuitem"]'
-                ));
-                const visible = items.filter(e => {
+    _OPEN_JS = """
+        () => {
+            const b = Array.from(document.querySelectorAll('button, [role="button"]'))
+                .find(e => {
+                    const a = (e.getAttribute('aria-label') || '').toLowerCase().trim();
+                    if (!a.startsWith('upload and tools')) return false;
                     const r = e.getBoundingClientRect();
                     return r.width > 0 && r.height > 0;
                 });
-                const target = visible.find(e =>
-                    (e.textContent || '').trim().toLowerCase() === 'create image'
-                );
-                if (!target) {
-                    return {
-                        picked: false,
-                        seen: visible.slice(0, 20).map(e =>
-                            (e.textContent || '').trim().slice(0, 40)
-                        ).filter(Boolean),
-                    };
-                }
-                const checked = (target.getAttribute('aria-checked') || '').toLowerCase() === 'true';
-                if (!checked) target.click();
-                return {picked: true, alreadyOn: checked};
+            if (!b) return {opened: false};
+            b.click();
+            return {opened: true};
+        }
+    """
+    # Match "Create image" across the menu-item roles Gemini uses; tolerate a
+    # trailing "New" badge and extra whitespace. Returns checked-state too.
+    _PICK_JS = """
+        (doClick) => {
+            const items = Array.from(document.querySelectorAll(
+                '[role="menuitemcheckbox"], [role="menuitem"], [role="option"], gem-menu-item, button'
+            )).filter(e => { const r = e.getBoundingClientRect();
+                             return r.width > 0 && r.height > 0; });
+            const norm = e => (e.textContent || '').replace(/\\s+/g, ' ')
+                                 .replace(/\\bnew\\b/i, '').trim().toLowerCase();
+            const target = items.find(e => norm(e) === 'create image' ||
+                                           norm(e).startsWith('create image'));
+            if (!target) {
+                return {found: false, seen: [...new Set(items.map(e =>
+                    (e.textContent||'').replace(/\\s+/g,' ').trim().slice(0,32))
+                    .filter(Boolean))].slice(0, 20)};
             }
-        """)
-    except Exception as e:
-        if verbose: print(f"[bot] create-image menu click err: {e}")
-        pick = {"picked": False}
+            const checked = (target.getAttribute('aria-checked') || '')
+                              .toLowerCase() === 'true';
+            if (doClick && !checked) target.click();
+            return {found: true, checked};
+        }
+    """
 
-    try: await page.keyboard.press("Escape")
-    except Exception: pass
-    await page.wait_for_timeout(300)
+    for attempt in range(1, 4):
+        try:
+            await _dismiss_modals(page, verbose=False)
+        except Exception:
+            pass
 
-    if pick and pick.get("picked"):
+        try:
+            opened = await page.evaluate(_OPEN_JS)
+        except Exception as e:
+            if verbose: print(f"[bot] create-image open err (try {attempt}): {e}")
+            opened = {"opened": False}
+        if not opened or not opened.get("opened"):
+            if verbose:
+                print(f"[bot] create-image: 'Upload and tools' not found (try {attempt})")
+            await page.wait_for_timeout(600)
+            continue
+        await page.wait_for_timeout(500)
+
+        try:
+            pick = await page.evaluate(_PICK_JS, True)
+        except Exception as e:
+            if verbose: print(f"[bot] create-image pick err (try {attempt}): {e}")
+            pick = {"found": False}
+        try: await page.keyboard.press("Escape")
+        except Exception: pass
+        await page.wait_for_timeout(400)
+
+        if not pick or not pick.get("found"):
+            if verbose:
+                print(f"[bot] create-image: item not in menu (try {attempt}). "
+                      f"Seen: {pick.get('seen') if pick else 'n/a'}")
+            continue
+        if pick.get("checked"):
+            if verbose: print(f"[bot] create-image: already enabled (try {attempt})")
+            return True
+
+        # We just clicked it — VERIFY it's now checked by reopening the menu.
+        try:
+            await _dismiss_modals(page, verbose=False)
+            reopen = await page.evaluate(_OPEN_JS)
+            if reopen and reopen.get("opened"):
+                await page.wait_for_timeout(400)
+                verify = await page.evaluate(_PICK_JS, False)
+                try: await page.keyboard.press("Escape")
+                except Exception: pass
+                await page.wait_for_timeout(300)
+                if verify and verify.get("found") and verify.get("checked"):
+                    if verbose: print(f"[bot] create-image: enabled + verified (try {attempt})")
+                    return True
+        except Exception:
+            pass
         if verbose:
-            state = "already enabled" if pick.get("alreadyOn") else "enabled"
-            print(f"[bot] create-image: {state}")
-        return True
+            print(f"[bot] create-image: clicked but not verified (try {attempt}) — retrying")
+        await page.wait_for_timeout(600)
+
     if verbose:
-        print("[bot] create-image: 'Create image' item not in menu. "
-              f"Seen: {pick.get('seen') if pick else 'n/a'}")
+        print("[bot] create-image: FAILED to enable after 3 attempts")
     return False
 
 
@@ -1471,6 +1542,7 @@ async def _wait_gemini_idle(page, max_wait_s: float = 420.0,
     # One Stop click isn't always enough — keep clicking until it sticks.
     last_stop_click = 0.0
     stuck_since: Optional[float] = None
+    abandons = 0   # how many times we've bailed to a fresh chat this call
     while time.time() < deadline:
         try:
             # Returns {busy: bool, why: str} — the `why` tells us which
@@ -1531,7 +1603,29 @@ async def _wait_gemini_idle(page, max_wait_s: float = 420.0,
                     stuck_since = time.time()
                 stuck_for = time.time() - stuck_since
                 since_click = time.time() - last_stop_click
-                if stuck_for >= 5.0 and since_click >= 15.0:
+                # WEDGED-CHAT ESCAPE: if the Stop button stays stuck past this
+                # threshold despite re-clicks, the chat is wedged (Gemini
+                # crashed mid-stream / React ignores the click). Re-clicking
+                # for the full 7-min deadline just hangs the pipeline — every
+                # send then fails with "input never became ready". Abandon the
+                # chat and open a FRESH one, which is idle by definition. Try
+                # this at most twice before falling through to the timeout.
+                if stuck_for >= _WEDGED_CHAT_SEC and abandons < 2:
+                    abandons += 1
+                    if verbose:
+                        print(f"[idle] Stop button wedged {int(stuck_for)}s — "
+                              f"abandoning chat, opening a fresh one "
+                              f"(attempt {abandons})")
+                    try:
+                        if await _start_new_chat(page, verbose=verbose):
+                            await page.wait_for_timeout(1200)
+                            stuck_since = None
+                            return True   # fresh chat is idle + ready
+                    except Exception as _e:
+                        if verbose:
+                            print(f"[idle] new-chat escape failed: {_e}")
+                    stuck_since = time.time()   # reset window, try once more
+                elif stuck_for >= 5.0 and since_click >= 15.0:
                     if verbose:
                         print(f"[idle] Stop button stuck for {int(stuck_for)}s — re-clicking")
                     await _click_stop_response(page, verbose=False)
@@ -1810,7 +1904,7 @@ async def _do_post_sequential_mode_singlechat(
         expected += 1
         if verbose: print(f"[seq] phase1 slide {i+1}/{n} — waiting for image count ≥ {expected}…")
         grew = False
-        MAX_REGEN = 2
+        MAX_REGEN = 3
         regens = 0
         per_attempt_timeout = max(200.0, wait_timeout / (MAX_REGEN + 1))
         while regens <= MAX_REGEN and not grew:
@@ -1849,13 +1943,30 @@ async def _do_post_sequential_mode_singlechat(
             if grew: break
             if stalled_at_idle and regens < MAX_REGEN:
                 regens += 1
+                # Text-only recovery alternates two strategies. Clicking
+                # Regenerate alone re-runs the IDENTICAL prompt Gemini just
+                # chose to answer in text (Thinking mode often writes a report
+                # instead of generating), so it frequently comes back text
+                # again. On odd attempts we instead send an explicit NUDGE that
+                # directly instructs an image — far more likely to flip it out
+                # of text mode. Even attempts fall back to the Regenerate button
+                # (helps when the nudge itself got a text reply).
+                use_nudge = (regens % 2 == 1)
                 if verbose:
                     print(f"[seq] phase1 slide {i+1} — text-only response, "
-                          f"clicking Regenerate (attempt {regens}/{MAX_REGEN})")
+                          f"{'nudging for image' if use_nudge else 'clicking Regenerate'} "
+                          f"(attempt {regens}/{MAX_REGEN})")
                 try:
-                    await _click_regenerate(page, verbose=verbose)
+                    if use_nudge:
+                        await _send_same_chat_strict(
+                            page,
+                            "Generate the image described in my previous message "
+                            "now, as a single image. Do not reply with text.",
+                            verbose=verbose, max_wait_s=60.0)
+                    else:
+                        await _click_regenerate(page, verbose=verbose)
                 except Exception: pass
-                # Wait briefly for the regenerate to start streaming again.
+                # Wait briefly for the regenerate/nudge to start streaming again.
                 await asyncio.sleep(4.0)
             else:
                 break
@@ -2090,7 +2201,24 @@ async def _do_create_image(prompt: str, save_to: str,
             await page.wait_for_timeout(1500)
         except Exception:
             pass
-        if not await _send_prompt(page, prompt, verbose=verbose):
+        # Enable Gemini's "Create image" tool BEFORE sending. Gemini moved
+        # image generation into the "Upload and tools" menu (2026-08) — without
+        # selecting it, Gemini replies with a TEXT description and
+        # _wait_for_image_element times out → the frame fails. The burst path
+        # (create_post_burst) already does this; the single-frame path
+        # (_do_create_image, used by create_image_and_download and the pipeline
+        # reroute) was missing it. Must be re-selected after each navigation
+        # since goto resets the composer's tool state.
+        await _select_create_image_tool(page, verbose=verbose)
+        # On the retry, append an explicit image instruction. A first-attempt
+        # timeout is most often a text-only reply (Thinking mode writes a
+        # report instead of generating), so re-running the identical prompt
+        # tends to fail the same way. Spelling out "single generated image,
+        # not text" nudges Gemini out of text mode.
+        send_prompt = prompt if attempt == 1 else (
+            prompt + "\n\nReturn the result as a single generated image, "
+            "not a text description.")
+        if not await _send_prompt(page, send_prompt, verbose=verbose):
             if attempt == 2: return None
             continue
         img = await _wait_for_image_element(

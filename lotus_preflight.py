@@ -24,7 +24,18 @@ from typing import Callable, Optional
 
 DEFAULT_CDP_PORT = 9222
 DEFAULT_PROFILE_DIR = Path.home() / ".lotus_auth" / "chrome_cdp_profile"
-GEMINI_START_URL = "https://gemini.google.com/app"
+def _authuser() -> int:
+    """Google account index for this Chrome profile (see
+    lotus_config.google_authuser). Pinned so the startup tab — and the
+    sign-in check built on it — target the same account the bots drive."""
+    try:
+        import lotus_config
+        return lotus_config.google_authuser()
+    except Exception:
+        return 0
+
+
+GEMINI_START_URL = f"https://gemini.google.com/u/{_authuser()}/app"
 SIGNIN_TIMEOUT_S = 600  # 10 min for the user to sign in before we give up
 
 
@@ -109,7 +120,11 @@ def _gemini_tab_state(port: int) -> Optional[bool]:
         if tab.get("type") != "page":
             continue
         url = (tab.get("url") or "").lower()
-        if "gemini.google.com/app" in url and "accounts.google.com" not in url:
+        # Account-agnostic: a multi-account profile serves Gemini at
+        # /u/<N>/app, so matching the literal "gemini.google.com/app" would
+        # miss every account but the first and hang forever at awaiting_signin.
+        if ("gemini.google.com" in url and "/app" in url
+                and "accounts.google.com" not in url):
             return True
         if "accounts.google.com" in url and "service=cl" in url:
             saw_signin = True
@@ -282,8 +297,14 @@ _CRBROWSER_PATCHED = (
 # patched form differs from the unpatched only by the appended `.catch`,
 # so we derive it to guarantee they stay in lockstep.
 _COREBUNDLE_REL = ("driver", "package", "lib", "coreBundle.js")
+# Start the match AT `this._browser._session.send(...)` rather than at the
+# `promises.push(` / `promises2.push(` prefix — Playwright renames that local
+# across versions (1.60: `promises.push`; 1.62: `promises2.push`), and pinning
+# to it broke the patch on every minor upgrade. The trailing `}));` (which the
+# `.catch` wrapper attaches to) is unchanged, so the derived patched form still
+# lines up.
 _COREBUNDLE_UNPATCHED = (
-    'promises.push(this._browser._session.send("Browser.setDownloadBehavior", {\n'
+    'this._browser._session.send("Browser.setDownloadBehavior", {\n'
     '            behavior: this._options.acceptDownloads === "accept" ? "allowAndName" : "deny",\n'
     '            browserContextId: this._browserContextId,\n'
     '            downloadPath: this._browser.options.downloadsPath,\n'

@@ -120,6 +120,11 @@ function openMainWindow(settings) {
     minimizable: true,
     fullscreenable: true,
     autoHideMenuBar: true,
+    // macOS: fire the control on the FIRST click even when the window is not
+    // yet the active window. Without this, clicking a button while LOTUS is in
+    // the background only focuses the window and swallows the click — which
+    // read as "buttons don't work / event not fired".
+    acceptFirstMouse: true,
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,

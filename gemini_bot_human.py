@@ -368,7 +368,8 @@ def _navigate_fresh_chat() -> bool:
                                       max_size=4_000_000) as ws:
             await ws.send(json.dumps({
                 "id": 1, "method": "Page.navigate",
-                "params": {"url": "https://gemini.google.com/app"},
+                "params": {"url": ("https://gemini.google.com/u/"
+                                   f"{lotus_config.google_authuser()}/app")},
             }))
             await asyncio.wait_for(ws.recv(), timeout=8.0)
         return True

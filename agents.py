@@ -259,13 +259,23 @@ class ReviewAgent(BaseAgent):
             raise RuntimeError(f"image not found: {image_path}")
 
         # 1. OCR the image (cheap, deterministic, catches exact text errors).
+        #    Pass the real file PATH — not Image.open(path). Handing pytesseract
+        #    a PIL image makes it write a temp copy (tess_*_input.png) into the
+        #    system temp dir and point tesseract at THAT. In the packaged .app
+        #    the private temp dir (/var/folders/.../T, or /tmp) isn't reliably
+        #    readable by the spawned tesseract binary → leptonica "image file
+        #    not found", whose stderr echoes the PNG's \x89 magic byte and then
+        #    crashes pytesseract's UTF-8 error decoder. Reading the original
+        #    path skips the temp copy; tesseract reads the frame directly.
+        ocr_text = ""
         try:
             import pytesseract
-            from PIL import Image
-            pil_img = Image.open(image_path)
-            ocr_text = pytesseract.image_to_string(pil_img)
+            ocr_text = pytesseract.image_to_string(image_path)
         except Exception as e:
-            raise RuntimeError(f"OCR failed: {e}")
+            # OCR is only the secondary text check; the Gemma-vision pass below
+            # is primary. Never fail the whole review on OCR — degrade to
+            # vision-only, mirroring the image-encode fallback just below.
+            print(f"[review] OCR failed, vision-only mode: {e}")
 
         ocr_text = (ocr_text or "").strip()
 
