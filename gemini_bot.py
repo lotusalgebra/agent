@@ -445,6 +445,70 @@ def _accept_fullres(save_path, label: str, verbose: bool) -> bool:
     return False
 
 
+_STAGING_DIR = Path(os.path.expanduser("~/.lotus_auth/download_staging"))
+
+
+async def _materialize_download(dl, save_path: Path, since_ts: float,
+                                verbose: bool = True) -> bool:
+    """Move a completed Playwright download to `save_path`, recovering when
+    Playwright's own artifact is missing.
+
+    Attaching to a REAL Chrome over CDP means Playwright often can't take
+    ownership of downloads: `Browser.setDownloadBehavior` fails and preflight
+    deliberately swallows that error (`.catch(() => {})`) because raising
+    would break CDP attach entirely. Chrome then saves the file **itself**,
+    into the `download.default_directory` that `lotus_preflight.
+    _ensure_download_prefs` pins at ~/.lotus_auth/download_staging. The
+    download event still fires, so `expect_download` returns — but
+    `dl.path()` names an artifact under /var/folders/.../playwright-artifacts-*
+    that was never created, and moving it raised FileNotFoundError. Every
+    later strategy then failed too (blob: src already revoked, canvas tainted
+    or 1024px), so the frame was marked FAILED while the real full-res file
+    sat in staging. That is the bug this repairs.
+
+    Order: dl.path() → dl.save_as() → newest matching file in staging.
+    """
+    # 1. The normal path — works whenever Playwright did own the download.
+    try:
+        tmp = await dl.path()
+        if tmp and os.path.exists(tmp):
+            shutil.move(str(tmp), str(save_path))
+            return True
+    except Exception:
+        pass
+
+    # 2. save_as() re-reads from Playwright's side; sometimes succeeds where
+    #    path() doesn't hand us a usable file.
+    try:
+        await dl.save_as(str(save_path))
+        if save_path.exists() and save_path.stat().st_size > 4096:
+            return True
+    except Exception:
+        pass
+
+    # 3. Chrome kept it. Pick the newest file that appeared in staging since
+    #    just before the click — matching on mtime rather than name because
+    #    Chrome appends " (1)", " (2)" on collisions.
+    try:
+        if _STAGING_DIR.is_dir():
+            fresh = [p for p in _STAGING_DIR.iterdir()
+                     if p.is_file() and not p.name.startswith(".")
+                     and not p.name.endswith(".crdownload")
+                     and p.stat().st_mtime >= since_ts - 2
+                     and p.stat().st_size > 4096]
+            if fresh:
+                newest = max(fresh, key=lambda p: p.stat().st_mtime)
+                shutil.move(str(newest), str(save_path))
+                if verbose:
+                    print(f"[bot] recovered native download from staging "
+                          f"({newest.name})")
+                return True
+    except Exception as e:
+        if verbose:
+            print(f"[bot] staging recovery failed: {e}")
+    return False
+
+
 async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> Optional[str]:
     """Save the rendered image to disk.
 
@@ -520,13 +584,13 @@ async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> 
                     await scoped_dl.scroll_into_view_if_needed(timeout=4000)
                 except Exception:
                     pass
+                _t0 = time.time()
                 async with page.expect_download(timeout=60_000) as dl_info:
                     await scoped_dl.click(timeout=15_000)
                 dl = await dl_info.value
-                tmp = await dl.path()
-                shutil.move(str(tmp), str(save_path))
-                if _accept_fullres(save_path, "downloaded via scoped button", verbose):
-                    return str(save_path)
+                if await _materialize_download(dl, save_path, _t0, verbose):
+                    if _accept_fullres(save_path, "downloaded via scoped button", verbose):
+                        return str(save_path)
         except Exception as e:
             if verbose:
                 print(f"[bot] scoped-locator download failed: {e} — trying legacy path")
@@ -600,6 +664,7 @@ async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> 
                                           bb["y"] + bb["height"]/2)
                     await page.wait_for_timeout(300)
             except Exception: pass
+            _t0 = time.time()
             async with page.expect_download(timeout=60_000) as dl_info:
                 await dl_button.click(timeout=15_000, force=True)
             # Clear the marker so subsequent slides don't race on it.
@@ -610,10 +675,9 @@ async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> 
                 )
             except Exception: pass
             dl = await dl_info.value
-            tmp = await dl.path()
-            shutil.move(str(tmp), str(save_path))
-            if _accept_fullres(save_path, "downloaded via scoped button", verbose):
-                return str(save_path)
+            if await _materialize_download(dl, save_path, _t0, verbose):
+                if _accept_fullres(save_path, "downloaded via scoped button", verbose):
+                    return str(save_path)
         else:
             if verbose:
                 print("[bot] no Download button found within this image's bubble — falling back")

@@ -244,6 +244,9 @@ async def _ensure_in_project(page, verbose: bool = True):
         return
     if verbose:
         print("[flow-video] not in a project — creating one")
+    # Clear promo/onboarding overlays FIRST — they sit above the New-project
+    # button and silently absorb the click (see _dismiss_onboarding).
+    await _dismiss_onboarding(page, verbose=verbose)
     await page.evaluate("""() => {
         const b = Array.from(document.querySelectorAll('button,[role=button],a'))
             .find(e => (e.getAttribute('aria-label') || e.textContent || '')
@@ -260,16 +263,26 @@ async def _ensure_in_project(page, verbose: bool = True):
 
 
 async def _dismiss_onboarding(page, verbose: bool = True) -> None:
-    """First-time Video onboarding banner has a 'Got it' button. Idempotent."""
-    for name in ("Got it", "Got it!"):
+    """Clear overlays that swallow clicks on the Flow home/composer.
+
+    Two distinct things appear here and BOTH intercept pointer events:
+      - the first-time Video onboarding banner ('Got it'), and
+      - Google's rotating promo banner ('Take Google Flow on the road…')
+        whose control is labelled 'Dismiss'.
+    The promo banner is what made `_ensure_project` fail with "Flow project
+    URL didn't appear after 'New project' click": the JS click dispatched
+    fine but landed on the banner, so no navigation happened. Exact-name
+    matching keeps this away from 'Delete project' / 'Edit project'.
+    Idempotent — safe to call repeatedly.
+    """
+    for name in ("Got it", "Got it!", "Dismiss"):
         try:
-            btn = page.get_by_role("button", name=name)
+            btn = page.get_by_role("button", name=name, exact=True)
             if await btn.count() > 0:
                 await btn.first.click(timeout=1500)
                 if verbose:
-                    print("[flow-video] dismissed onboarding banner")
+                    print(f"[flow-video] dismissed banner ({name!r})")
                 await page.wait_for_timeout(400)
-                return
         except Exception:
             pass
 

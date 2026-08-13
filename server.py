@@ -510,7 +510,11 @@ class DashboardServer:
                         raw = self.rfile.read(length) if length > 0 else b"{}"
                         payload = json.loads(raw or b"{}")
                         choice = (payload.get("pipeline") or "").strip().lower()
-                        valid = {"playwright", "human", "api"}
+                        # Must track agent_phase1._GEN_ENGINES. 'flow' (Google
+                        # Flow / Nano Banana, 2K) was added to the engine map
+                        # but never here, so the UI could not switch to it —
+                        # the endpoint 400'd on a perfectly valid engine.
+                        valid = {"playwright", "human", "api", "flow"}
                         if choice not in valid:
                             body = json.dumps({
                                 "error": f"pipeline must be one of {sorted(valid)}",
