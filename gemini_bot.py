@@ -509,6 +509,54 @@ async def _materialize_download(dl, save_path: Path, since_ts: float,
     return False
 
 
+# Gemini's DownloadGeneratedImage RPC (batchexecute rpcid "c8o8Fe") takes an
+# optional 5th field: the download resolution. Since 2026-09-22 the web UI
+# no longer sends it — the old <download-generated-image-button> is flag-gated
+# off and the surviving "Download image" button omits the field — so the server
+# returns a 1K preview (928x1152 / 1024x1024) that _accept_fullres rightly
+# rejects. The server still honours the field; verified live 2026-09-23:
+#   (absent) -> 1K preview   1 -> 2K (1856x2304, what the old full-size button
+#   gave)   2 -> 4K (3712x4608, ~8 MB)   3 -> not a size; don't use.
+# So we rewrite the page's own request in flight and let the normal click →
+# staging → full-res gate path carry on unchanged.
+_DOWNLOAD_RES = int(os.environ.get("LOTUS_GEMINI_DOWNLOAD_RES", "1"))
+
+
+async def _ensure_fullres_download_route(page, verbose: bool = True) -> None:
+    """Install (once per page) a route that adds the resolution field to
+    Gemini's c8o8Fe download RPC. Harmless if the page already sends one."""
+    if getattr(page, "_lotus_fullres_route", False):
+        return
+    import json
+    from urllib.parse import parse_qs, urlencode
+
+    async def _rewrite(route):
+        req = route.request
+        try:
+            post = parse_qs(req.post_data or "", keep_blank_values=True)
+            freq = json.loads(post["f.req"][0])
+            call = freq[0][0]
+            inner = json.loads(call[1])
+            if call[0] == "c8o8Fe" and len(inner) == 4:
+                inner.append(_DOWNLOAD_RES)
+                call[1] = json.dumps(inner)
+                post["f.req"] = [json.dumps(freq)]
+                if verbose:
+                    print(f"[bot] full-res route: requesting download "
+                          f"resolution={_DOWNLOAD_RES} from Gemini")
+                await route.continue_(post_data=urlencode(post, doseq=True))
+                return
+        except Exception as e:
+            if verbose:
+                print(f"[bot] full-res route: could not rewrite c8o8Fe ({e}) — "
+                      f"sending unmodified")
+        await route.continue_()
+
+    await page.route(lambda url: "batchexecute" in url and "rpcids=c8o8Fe" in url,
+                     _rewrite)
+    page._lotus_fullres_route = True
+
+
 async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> Optional[str]:
     """Save the rendered image to disk.
 
@@ -524,6 +572,12 @@ async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> 
     """
     save_path = Path(save_to)
     save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        await _ensure_fullres_download_route(page, verbose)
+    except Exception as e:
+        if verbose:
+            print(f"[bot] full-res route install failed: {e}")
 
     # PRIMARY — SCOPED hover & click. Walk up from THIS img to its
     # message-bubble container, then click the Download button that
