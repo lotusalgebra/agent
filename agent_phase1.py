@@ -18,6 +18,7 @@ from typing import Optional
 import lotus_config
 import lotus_prompts_db
 import lotus_pipelines_db
+import lotus_imgutil
 from voice import VoiceEngine
 
 
@@ -34,13 +35,13 @@ _GEN_ENGINES = {
     "playwright": ("gemini_bot",       "create_image_and_download"),
     "human":      ("gemini_bot_human", "create_image_and_download"),
     "api":        ("gemini_api",       "create_image_and_download"),
-    # Google Flow (labs.google/fx/tools/flow) — Nano Banana 2 image gen
-    # via Playwright + CDP. Separate quota from the Gemini-chat browser
-    # path; useful when chat is rate-limited or hanging on long prompts.
-    # MVP scope: outputs at Flow's currently-selected aspect (typically
-    # 9:16) — set 9:16 in Flow's UI for Story carousels. Post slides
-    # (4:5 target) should fall through to playwright/api in the chain.
-    "flow":       ("flow_bot",         "create_image_and_download"),
+    # Google Flow (labs.google/fx/tools/flow) — Nano Banana image gen via
+    # Playwright + CDP. Uses flow_video.text_to_image (the current, popover-
+    # driven Flow UI + 2K downloads + per-path aspect inference), NOT the
+    # obsolete flow_bot.py which only handled 9:16 Story frames and targeted
+    # the pre-2026-07 Flow UI (it returned None for Post/4:5 frames, silently
+    # breaking the 'flow' image pipeline).
+    "flow":       ("flow_video",       "create_image_and_download"),
 }
 
 def _resolve_pipeline_choice() -> str:
@@ -144,6 +145,100 @@ def _gen_image(prompt: str, target: str, verbose: bool = True) -> Optional[str]:
 
     if verbose:
         print("[gen] giving up on this frame — pipeline will continue")
+    return None
+
+
+# ═══════════════════════════════════════════════════════
+#  VIDEO GENERATION  (Flow primary → Grok fallback)
+# ═══════════════════════════════════════════════════════
+#
+# Mirrors the image chain above but for video. Two engines, each exposing a
+# grok-compatible image_to_video(image_path, prompt, ...) -> Optional[str]:
+#   flow  — flow_video.py : Google Flow / Veo, image-to-video AND text-to-video
+#   grok  — grok_video.py : grok.com/imagine, image-to-video ONLY
+# The third tuple slot names the text-to-video callable, or None when the
+# engine can't do prompt-only clips (Grok can't) — so text-to-video silently
+# skips engines that lack it.
+#
+# ⚠️ Unlike image gen (free), every video render spends provider credits. This
+# chain is a callable entry point only; it is deliberately NOT wired into the
+# automated pipeline stages, so nothing here fires without an explicit call.
+_VIDEO_ENGINES = {
+    "flow": ("flow_video", "image_to_video", "text_to_video"),
+    "grok": ("grok_video", "image_to_video", None),
+}
+
+
+def _resolve_video_pipeline_choice() -> str:
+    """Primary video engine. Env beats config; unknown values fall back to
+    'flow'. Parallels _resolve_pipeline_choice for images."""
+    env = os.environ.get("LOTUS_GEN_VIDEO_PIPELINE", "").strip().lower()
+    if env in _VIDEO_ENGINES:
+        return env
+    try:
+        import lotus_config as _lc
+        choice = (_lc.load().get("video", {}).get("pipeline") or "").strip().lower()
+        if choice in _VIDEO_ENGINES:
+            return choice
+    except Exception:
+        pass
+    return "flow"
+
+
+def _gen_video_chain(primary: str) -> list:
+    natural = ["flow", "grok"]
+    return [primary] + [e for e in natural if e != primary]
+
+
+def _gen_video(prompt: str, target: str, image_path: Optional[str] = None, *,
+               aspect: str = "9:16", duration="8s",
+               verbose: bool = True) -> Optional[str]:
+    """Single entry point for video generation. When `image_path` is given,
+    animates that frame (image-to-video); when it's None, generates from the
+    prompt alone (text-to-video). Tries Flow first, then Grok; first success
+    wins. Returns the saved MP4 path or None.
+
+    Runtime primary selection (like images):
+      - ~/.lotus_config.json `video.pipeline`   (persisted)
+      - LOTUS_GEN_VIDEO_PIPELINE env var         (boot-time override)
+    """
+    primary = _resolve_video_pipeline_choice()
+    chain = _gen_video_chain(primary)
+    text_only = image_path is None
+    if verbose:
+        kind = "text→video" if text_only else "image→video"
+        print(f"[vid] {kind} pipeline: {primary} (chain: {chain})")
+
+    for engine in chain:
+        mod_name, img_fn, txt_fn = _VIDEO_ENGINES[engine]
+        fn_name = txt_fn if text_only else img_fn
+        if fn_name is None:
+            if verbose:
+                print(f"[vid] {engine} has no text-to-video — skipping")
+            continue
+        try:
+            mod = __import__(mod_name)
+            if hasattr(mod, "is_available") and not mod.is_available():
+                if verbose:
+                    print(f"[vid] {mod_name} unavailable — skipping")
+                continue
+            fn = getattr(mod, fn_name)
+            if text_only:
+                path = fn(prompt, save_to=target, aspect=aspect,
+                          duration=duration, verbose=verbose)
+            else:
+                path = fn(image_path, prompt, save_to=target, aspect=aspect,
+                          duration=duration, verbose=verbose)
+            if path:
+                return path
+            if verbose:
+                print(f"[vid] {mod_name} returned no video")
+        except Exception as e:
+            if verbose:
+                print(f"[vid] {mod_name} error: {e}")
+
+    if verbose:
+        print("[vid] giving up on this clip")
     return None
 
 
@@ -1058,6 +1153,14 @@ def _sanitize_for_folder(s: str, max_len: int = 30) -> str:
 _FOLDER_NAME_UNSET = object()
 
 
+def _prompt_text_hash(text: str) -> str:
+    """SHA-1 of the prompt's text, used by the frame-resume check to verify
+    that an on-disk FrameN.png was generated from the same prompt we're now
+    about to render — see lotus_pipelines_db.frame_provenance_hash."""
+    import hashlib as _hashlib
+    return _hashlib.sha1((text or "").encode("utf-8")).hexdigest()
+
+
 class Pipeline:
     """In-memory state for the interactive content pipeline.
 
@@ -1066,11 +1169,29 @@ class Pipeline:
     approval (voice or dashboard). Save destination is also user-driven.
     """
     def __init__(self, pipeline_id: str, source_md: str, name: str = "",
-                 folder_name=_FOLDER_NAME_UNSET):
+                 folder_name=_FOLDER_NAME_UNSET, kind: str = "image"):
         import uuid as _uuid
         import threading as _th
         import time as _time
         self.id = pipeline_id or _uuid.uuid4().hex[:8]
+        # Pipeline kind: "image" (Gemini/Flow still images — the original
+        # pipeline) or "video" (Flow/Veo text-to-video clips). Drives which
+        # generation path the 'generating' stage dispatches to and which
+        # stage graph the dashboard renders. Broadcast to the UI as
+        # `pipeline_type` (kept distinct from the engine name, e.g. 'flow').
+        self.kind = kind if kind in ("image", "video", "flow_image") else "image"
+        # Cinematic storyboard (see CINEMATIC_FORMAT.md): a film runs BOTH
+        # halves in one pipeline — stills first, clips second — rather than
+        # being image-or-video like `kind`. `cinematic` is set at load time
+        # when the source document contains motion prompts; `phase` tracks
+        # which half we're in:
+        #   'boards' — rendering assets + act keyframes (free)
+        #   'clips'  — animating each approved keyframe in Flow (costs credits)
+        # The boards→clips handoff is double-gated: the user approved each
+        # motion prompt at the prompt-review step AND each board at the frame-
+        # review step before a single credit is spent.
+        self.cinematic = False
+        self.phase = "boards"
         raw_name = (name or "").strip()
         self.name = raw_name or f"Pipeline {self.id}"
         # Per-pipeline top-level folder name — `<sanitized>_<MMDDYYYY>` so
@@ -1083,8 +1204,12 @@ class Pipeline:
         if folder_name is _FOLDER_NAME_UNSET:
             slug = _sanitize_for_folder(raw_name)
             today = datetime.now().strftime("%m%d%Y")
+            # Always include `id` so two pipelines with the same name on the
+            # same day get distinct folders. Without this, a fresh pipeline
+            # would land in the previous one's folder and the resume check
+            # below would adopt its stale FrameN.png files (off-by-one bug).
             if slug:
-                self.folder_name: Optional[str] = f"{slug}_{today}"
+                self.folder_name: Optional[str] = f"{slug}_{self.id}_{today}"
             else:
                 self.folder_name = f"pipeline{self.id}_{today}"
         else:
@@ -1127,6 +1252,10 @@ class Pipeline:
             "id": self.id,
             "name": self.name,
             "folder_name": self.folder_name,
+            "kind": self.kind,
+            "pipeline_type": self.kind,   # UI reads pipeline_type; alias of kind
+            "cinematic": self.cinematic,
+            "phase": self.phase,
             "stage": self.stage,
             "source_md": self.source_md,
             "source_hash": self.source_hash,
@@ -1150,6 +1279,8 @@ class Pipeline:
         return {
             "id": self.id,
             "name": self.name,
+            "kind": self.kind,
+            "pipeline_type": self.kind,   # UI tab reads pipeline_type
             "stage": self.stage,
             "paused": self.paused,
             "cancelled": self.cancelled,
@@ -1386,15 +1517,26 @@ class LotusPhase1:
                     result = f"Focus switched to {fid}."
                 else:
                     result = f"Could not focus pipeline {fid!r}."
+            elif action == "reopen_pipeline":
+                # Reactivate a finished/terminal pipeline into the live
+                # registry (force-paused at review_frames) so the user can
+                # regenerate individual frames. See _reopen_pipeline.
+                result = self._reopen_pipeline(
+                    payload.get("id") or payload.get("pipeline_id"))
             elif action == "start_pipeline":
                 # Manual creation from the All-Pipelines overview button.
                 # Name only — the new pipeline parks at ask_location, user
                 # supplies the source MD via the existing SourceDropzone.
+                # `kind` ('image'|'video') picks the pipeline type; the video
+                # nav toggle sends kind='video'.
                 nm = (payload.get("name") or "").strip()
+                knd = (payload.get("kind") or "image").strip().lower()
+                if knd not in ("image", "video", "flow_image"):
+                    knd = "image"
                 if not nm:
                     result = "start_pipeline: name required"
                 else:
-                    result = self._tool_start_pipeline(name=nm)
+                    result = self._tool_start_pipeline(name=nm, kind=knd)
             elif action == "backfill_pipeline_folder":
                 # A11 — give a legacy pipeline (no folder_name) a per-pipeline
                 # folder going forward. Past renders stay in <brand><MMDDYYYY>;
@@ -1644,7 +1786,15 @@ class LotusPhase1:
 
     def _on_dashboard_pipeline(self, action: str, payload: dict) -> None:
         """Dashboard-driven pipeline control (approve/deny/regen/save)."""
-        print(f"[pipeline-msg] action={action!r} payload={payload}", flush=True)
+        # Never let a dead/broken stdout pipe abort dispatch. When the mother
+        # is orphaned (its Electron parent exited but the process survives and
+        # still serves :8765/:8766), a raw print here raises BrokenPipeError
+        # *before* the try below — which silently killed this daemon thread and
+        # dropped every dashboard action (approve/deny/save) with no feedback.
+        try:
+            print(f"[pipeline-msg] action={action!r} payload={payload}", flush=True)
+        except Exception:
+            pass
         try:
             if action == "set_source":
                 path = os.path.expanduser((payload.get("path") or "").strip())
@@ -3697,7 +3847,8 @@ class LotusPhase1:
                 # existing pipelines to a new folder, breaking continuity).
                 p = Pipeline(row["id"], row.get("source_md") or "",
                              name=row.get("name") or "",
-                             folder_name=row.get("folder_name"))
+                             folder_name=row.get("folder_name"),
+                             kind=row.get("kind") or "image")
                 p.stage = row.get("stage") or "ask_location"
                 p.source_hash = row.get("source_hash")
                 p.created_at = float(row.get("created_at") or p.created_at)
@@ -3711,7 +3862,7 @@ class LotusPhase1:
                 # the review-gate DB so the UI has something to show.
                 if p.source_hash:
                     try:
-                        rs = lotus_prompts_db.list_for_source(p.source_hash)
+                        rs = lotus_prompts_db.list_for_pipeline(p.id)
                         p.prompts = [
                             {
                                 "id":           str(r["id"]),
@@ -3722,6 +3873,8 @@ class LotusPhase1:
                                 "text":         r["edited_text"] or r["text"],
                                 "edited":       bool(r["edited_text"]),
                                 "status":       r["status"],
+                                "kind":         r.get("kind") or "image",
+                                "act_number":   r.get("act_number"),
                             }
                             for r in rs
                         ]
@@ -3840,7 +3993,8 @@ class LotusPhase1:
         self._pipeline_broadcast()
 
     def _tool_start_pipeline(self, source_md: Optional[str] = None,
-                             name: Optional[str] = None) -> str:
+                             name: Optional[str] = None,
+                             kind: str = "image") -> str:
         """Start the interactive content pipeline.
 
         Flow (new default — Gemma auto-approves prompts):
@@ -3848,10 +4002,12 @@ class LotusPhase1:
           → pause at review_frames (voice-driven) → save (voice-driven) → done
 
         `name` is shown in the dashboard tab so multiple pipelines are
-        distinguishable (e.g. "Agni Launch").
+        distinguishable (e.g. "Agni Launch"). `kind` is "image" (default) or
+        "video" — a video pipeline runs the same prompts spine but the
+        'generating' stage produces Veo/Flow clips instead of stills.
         """
         import uuid as _uuid
-        pipeline = Pipeline(_uuid.uuid4().hex[:8], "", name=name or "")
+        pipeline = Pipeline(_uuid.uuid4().hex[:8], "", name=name or "", kind=kind)
         # Clear any stale stop signal from a previously cancelled run so
         # this fresh pipeline isn't aborted the moment it starts.
         self._stop_event.clear()
@@ -4153,16 +4309,18 @@ class LotusPhase1:
         print(f"[pipeline] Gemma extracted {len(normalised)} prompt(s) "
               f"from {os.path.basename(path)}")
 
-        # Persist to the prompts DB. UNIQUE on (source_hash, text_hash) so a
-        # second upload of the same file dedupes against the existing rows
-        # (preserving any prior approve/reject/edit state).
+        # Persist to the prompts DB. UNIQUE on (pipeline_id, text_hash) so a
+        # second upload of the same file INTO THIS PIPELINE dedupes against
+        # its existing rows (preserving prior approve/reject/edit state).
         source_hash = lotus_prompts_db.file_hash(path)
-        rows = lotus_prompts_db.add_batch(path, source_hash, normalised)
-        print(f"[pipeline] DB now has {len(rows)} prompt(s) for this source "
-              f"(hash={source_hash[:12]})")
-
         p.source_md = path
         p.source_hash = source_hash
+        # Prompts are owned by THIS pipeline (one-to-many): keying on p.id
+        # means a second pipeline built from the same file gets its own
+        # independent rows and review state — no cross-pipeline bleed.
+        rows = lotus_prompts_db.add_batch(path, source_hash, p.id, normalised)
+        print(f"[pipeline] DB now has {len(rows)} prompt(s) for pipeline "
+              f"{p.id} (source hash={source_hash[:12]})")
         p.prompts = [
             {
                 "id":           str(r["id"]),
@@ -4173,12 +4331,26 @@ class LotusPhase1:
                 "text":         r["edited_text"] or r["text"],
                 "edited":       bool(r["edited_text"]),
                 "status":       r["status"],
+                "kind":         r.get("kind") or "image",
+                "act_number":   r.get("act_number"),
             }
             for r in rows
         ]
+        # A film document carries motion prompts beside its keyframes. That's
+        # what makes this pipeline two-phase: boards first, then clips.
+        n_motion = sum(1 for pr in p.prompts if pr.get("kind") == "motion")
+        p.cinematic = n_motion > 0
+        p.phase = "boards"
+        if p.cinematic:
+            n_asset = sum(1 for pr in p.prompts if pr.get("kind") == "asset")
+            n_key = sum(1 for pr in p.prompts if pr.get("kind") == "image")
+            print(f"[pipeline] cinematic source: {n_asset} asset(s), "
+                  f"{n_key} keyframe(s), {n_motion} motion prompt(s). "
+                  f"Boards render first; clips follow board approval.",
+                  flush=True)
         p.stage = "review_prompts"
         self._pipeline_broadcast()
-        counts = lotus_prompts_db.count_by_status(source_hash)
+        counts = lotus_prompts_db.count_by_status(p.id)
         return True, (f"Loaded {len(rows)} prompts from "
                       f"{os.path.basename(path)} "
                       f"(approved={counts['approved']}, "
@@ -4211,17 +4383,12 @@ class LotusPhase1:
             if item["status"] == "pending":
                 item["status"] = "approved"
         # Mirror to DB — only flip rows that are still pending so a
-        # previously-rejected prompt isn't silently re-approved.
-        if p.source_hash:
-            try:
-                with lotus_prompts_db._lock, lotus_prompts_db._conn() as c:
-                    c.execute(
-                        "UPDATE prompts SET status='approved', "
-                        "updated_at=? WHERE source_hash=? AND status='pending'",
-                        (datetime.utcnow().isoformat(), p.source_hash),
-                    )
-            except Exception as e:
-                print(f"[prompts-db] approve_all: {e}", flush=True)
+        # previously-rejected prompt isn't silently re-approved. Scoped to
+        # this pipeline's rows (one-to-many), never the whole source file.
+        try:
+            lotus_prompts_db.approve_pending(p.id)
+        except Exception as e:
+            print(f"[prompts-db] approve_all: {e}", flush=True)
         self._pipeline_broadcast()
 
     def _pipeline_approve_subset_and_run(self, prompt_ids: list,
@@ -4417,6 +4584,104 @@ class LotusPhase1:
             results.append((f"Post{post_idx}", frame_idx))
         return results
 
+    def _reopen_pipeline(self, fid: str) -> str:
+        """Bring a finished/terminal pipeline back into the live registry so
+        its frames can be reviewed and individually regenerated.
+
+        Reconstructs prompts (from the review-gate DB) and frames (from disk,
+        using the SAME `_infer_post_slots` + `next_frame_path` derivation the
+        generator uses, so the frame↔prompt mapping is exact and we adopt the
+        existing FrameN.png files instead of allocating new slots). Lands
+        force-paused at `review_frames`; NO rendering is kicked — the user
+        explicitly hits Regenerate on the bad frames, which reuses the live
+        per-frame regen path. Idempotent: an already-live pipeline is just
+        focused."""
+        if not fid:
+            return "reopen: id required"
+        if fid in self._pipelines:
+            self._focus_pipeline(fid)
+            return f"Reopened {fid} (already live)."
+        row = lotus_pipelines_db.get(fid)
+        if not row:
+            return f"reopen: pipeline {fid!r} not found"
+        p = Pipeline(row["id"], row.get("source_md") or "",
+                     name=row.get("name") or "",
+                     folder_name=row.get("folder_name"))
+        p.source_hash = row.get("source_hash")
+        p.created_at = float(row.get("created_at") or p.created_at)
+        p.cancelled = False
+        # Prompts from the review-gate DB (same shape as rehydrate).
+        if p.source_hash:
+            try:
+                rs = lotus_prompts_db.list_for_pipeline(p.id)
+                p.prompts = [
+                    {
+                        "id":           str(r["id"]),
+                        "db_id":        r["id"],
+                        "title":        r["slide_title"],
+                        "topic_number": r["topic_number"],
+                        "slide_number": r["slide_number"],
+                        "text":         r["edited_text"] or r["text"],
+                        "edited":       bool(r["edited_text"]),
+                        "status":       r["status"],
+                        "kind":         r.get("kind") or "image",
+                        "act_number":   r.get("act_number"),
+                    }
+                    for r in rs
+                ]
+            except Exception as e:
+                print(f"[reopen] prompt reload for {fid} failed ({e})", flush=True)
+        # Reconstruct frames from disk using the generator's own derivation so
+        # FrameN.png files map back to their originating prompt exactly.
+        try:
+            pipeline_parent = p.parent_folder()
+            slots = self._infer_post_slots(p.prompts)
+            root = os.path.expanduser(
+                lotus_config.load()["image"].get(
+                    "projects_root", "~/LotusAgent/Projects"))
+            p.frames = []
+            for i, prompt in enumerate(p.prompts):
+                if prompt.get("status") != "approved":
+                    continue
+                section, slide_idx = slots[i]
+                try:
+                    target_path = lotus_config.next_frame_path(
+                        section, slide_idx, parent=pipeline_parent)
+                except Exception:
+                    target_path = lotus_config.next_frame_path(
+                        "Post1", parent=pipeline_parent)
+                    section = "Post1"
+                rel = os.path.relpath(target_path, root).replace(os.sep, "/")
+                url = "/projects/" + rel
+                exists = (os.path.exists(target_path)
+                          and os.path.getsize(target_path) > 2048)
+                p.frames.append({
+                    "id":          f"f{i+1}",
+                    "prompt_id":   prompt["id"],
+                    "prompt_text": prompt["text"],
+                    "section":     section,
+                    "slide_idx":   slide_idx,
+                    "final_path":  target_path,
+                    "final_url":   url if exists else None,
+                    "temp_url":    url if exists else None,
+                    "status":      "pending_review" if exists else "failed",
+                    "resumed":     exists,
+                    "source":      "lotus" if exists else None,
+                    "error":       None if exists else "missing on disk — regenerate",
+                    "retry_count": 0,
+                })
+        except Exception as e:
+            print(f"[reopen] frame reconstruct for {fid} failed ({e})", flush=True)
+            p.frames = []
+        p.stage = "review_frames"
+        p.paused = True
+        p.pause_reason = "reopened to regenerate frames"
+        self._pipelines[fid] = p
+        self._focus_pipeline(fid)
+        self._pipeline_broadcast()
+        n = len(p.frames)
+        return f"Reopened {p.name or fid} — {n} frame(s) ready for review."
+
     def _pipeline_generate_approved(self) -> None:
         """Loop through approved prompts generating each image DIRECTLY
         into the proper Post{N}/Frame{M}.png based on slide markers. No
@@ -4425,6 +4690,18 @@ class LotusPhase1:
         ones in-place."""
         p = self._active_pipeline
         if not p: return
+        # A cinematic pipeline in its clips phase animates approved keyframes
+        # regardless of `kind` — it's an image pipeline that has finished its
+        # boards. Checked before `kind` so the phase wins.
+        if getattr(p, "cinematic", False) and getattr(p, "phase", "boards") == "clips":
+            return self._pipeline_generate_approved_video()
+        # Video pipelines share this kickoff (all four call sites) but run a
+        # different generator — clips via Veo/Flow instead of stills. Delegate
+        # so we don't duplicate the approve/thread plumbing per call site.
+        if getattr(p, "kind", "image") == "video":
+            return self._pipeline_generate_approved_video()
+        if getattr(p, "kind", "image") == "flow_image":
+            return self._pipeline_generate_approved_flow_image()
         p.stage = "generating"
         self._pipeline_broadcast()
         # A10 — render output goes into THIS pipeline's own folder so
@@ -4501,14 +4778,38 @@ class LotusPhase1:
             url = "/projects/" + rel
             fid = f"f{i+1}"
 
-            # RESUME CHECK — if the target file already exists (non-zero
-            # size, not a broken tmp), treat it as already-done.
+            # RESUME CHECK — only adopt an existing file as "already done"
+            # if its recorded prompt_text_hash matches the prompt we're
+            # about to render. Legacy frames (no provenance row) or stale
+            # frames from a different prompt re-render. Without this guard
+            # a fresh pipeline landing in a folder with prior FrameN.png
+            # files would silently inherit them and show the wrong content
+            # under the new prompts.
             already_done = False
             try:
-                already_done = (
-                    os.path.exists(target_path)
-                    and os.path.getsize(target_path) > 2048  # reject empty / half-writes
-                )
+                # Only ever ADOPT an existing file that is a real full-res
+                # asset — a low-res preview (old save bug) is not "done".
+                if os.path.exists(target_path) and lotus_imgutil.is_fullres(target_path):
+                    recorded = lotus_pipelines_db.frame_provenance_hash(target_path)
+                    current = _prompt_text_hash(prompt["text"])
+                    if recorded == current:
+                        already_done = True          # same prompt — reuse
+                    elif not recorded:
+                        # A valid full-res image is already on disk but carries
+                        # no provenance row (lost / written by another path).
+                        # REUSE it. A missing row must NEVER trigger
+                        # destroy-and-regenerate of a good frame — that was the
+                        # storm that overwrote good frames and hammered Chrome.
+                        # Heal the row so the match is clean next time.
+                        already_done = True
+                        try:
+                            lotus_pipelines_db.record_frame(
+                                target_path, current,
+                                pipeline_id=p.id, frame_id=fid)
+                        except Exception:
+                            pass
+                    # else: a provenance row exists for a DIFFERENT prompt —
+                    # genuinely stale content; fall through and re-render.
             except Exception:
                 already_done = False
 
@@ -4596,6 +4897,13 @@ class LotusPhase1:
                     fr["final_url"]  = url2
                     fr["temp_url"]   = url2
                     fr["status"]     = "pending_review"
+                    try:
+                        lotus_pipelines_db.record_frame(
+                            path,
+                            _prompt_text_hash(fr.get("prompt_text", "")),
+                            pipeline_id=p.id, frame_id=fr.get("id"))
+                    except Exception as _pe:
+                        print(f"[pipeline] provenance record failed: {_pe}")
                     print(f"[pipeline] saved {fr['id']} → "
                           f"{section}/{os.path.basename(path)}")
                 else:
@@ -4631,6 +4939,13 @@ class LotusPhase1:
                     fr["status"]     = "pending_review"
                     fr["source"]     = "lotus"
                     fr["error"]      = None
+                    try:
+                        lotus_pipelines_db.record_frame(
+                            path,
+                            _prompt_text_hash(fr.get("prompt_text", "")),
+                            pipeline_id=p.id, frame_id=fr.get("id"))
+                    except Exception as _pe:
+                        print(f"[pipeline] provenance record failed: {_pe}")
                     print(f"[pipeline] saved {fr['id']} → "
                           f"{section}/{os.path.basename(path)}")
                     # Agent mesh: submit this freshly-saved frame to
@@ -4682,20 +4997,40 @@ class LotusPhase1:
             # mid-burst failure escapes that, the unfinished frames are
             # marked failed by the stuck-sweep below and the user
             # resolves them via the per-frame Retry button.
+            # RENDER: sequential per-frame via _gen_image, which honours the
+            # configured image.pipeline engine chain (flow → playwright → api).
+            # This replaces the old gemini_bot.create_post_burst (Gemini-chat
+            # burst), whose "input never became ready / SEND FAILED" breakage
+            # silently failed every frame. _gen_image routes through the proven
+            # flow_video (Flow / Nano Banana, 2K) when image.pipeline=flow, and
+            # falls back per-frame otherwise. `_cb` does all the save/status/
+            # provenance/review bookkeeping, so we just feed it each result.
             try:
-                gemini_bot.create_post_burst(
-                    tasks, verbose=True, on_done=_cb,
-                )
+                for slide_idx, fr in enumerate(frames):
+                    if self._stop_event.is_set() or p.cancelled:
+                        break
+                    prompt = fr.get("prompt_text", "")
+                    target = fr.get("final_path")
+                    if not prompt or not target:
+                        _cb(post_idx_abs, slide_idx, None)
+                        continue
+                    try:
+                        with LotusPhase1._gemini_lock:
+                            path = _gen_image(prompt, target, verbose=True)
+                    except Exception as _ge:
+                        print(f"[pipeline] gen error {fr.get('id')}: {_ge}")
+                        path = None
+                    _cb(post_idx_abs, slide_idx, path)
             except Exception as e:
-                print(f"[pipeline] burst error on {section}: {e}")
+                print(f"[pipeline] render error on {section}: {e}")
                 try:
                     import time as _time
                     p.errors.append({
                         "ts":       _time.time(),
                         "frame_id": "",
                         "section":  section,
-                        "stage":    "burst",
-                        "message":  f"burst error: {e}",
+                        "stage":    "render",
+                        "message":  f"render error: {e}",
                     })
                 except Exception: pass
 
@@ -4752,6 +5087,406 @@ class LotusPhase1:
                 import lotus_history
                 lotus_history.end_run(p.history_run_id, status="completed")
         except Exception: pass
+
+    def _maybe_start_clips(self) -> bool:
+        """Boards→clips handoff for a cinematic pipeline.
+
+        Called wherever the image half reaches a terminal state. Starts the
+        video stage on its own thread when, and only when:
+          - the source was a film document (motion prompts present),
+          - we're still in the 'boards' phase (idempotent — a second call
+            after clips began is a no-op),
+          - at least one motion prompt was APPROVED at prompt review, and
+          - at least one board actually rendered to disk.
+
+        Credits: every clip costs Flow credits (~7+ each), so this is
+        deliberately gated twice over — the user approved each motion prompt
+        individually at prompt review, then approved the boards at frame
+        review. Set LOTUS_CINEMATIC_AUTO_CLIPS=0 to require a manual kick
+        instead (the pipeline parks in the 'clips' phase and the existing
+        generate action starts it).
+        """
+        import threading as _th
+        p = self._active_pipeline
+        if not p or p.cancelled:
+            return False
+        if not getattr(p, "cinematic", False) or getattr(p, "phase", "boards") != "boards":
+            return False
+
+        motion = [pr for pr in p.prompts
+                  if pr.get("kind") == "motion" and pr.get("status") == "approved"]
+        if not motion:
+            print("[pipeline] cinematic: no approved motion prompts — "
+                  "boards only, nothing to animate.", flush=True)
+            return False
+
+        boards = [f for f in p.frames
+                  if f.get("media") != "video" and f.get("final_path")
+                  and f.get("status") not in ("failed", "rejected")]
+        if not boards:
+            print("[pipeline] cinematic: no rendered boards to animate — "
+                  "not spending credits on text→video for a whole film.",
+                  flush=True)
+            return False
+
+        p.phase = "clips"
+        if os.environ.get("LOTUS_CINEMATIC_AUTO_CLIPS", "1").strip() == "0":
+            print(f"[pipeline] cinematic: boards done, {len(motion)} clip(s) "
+                  f"ready. Auto-clips disabled — start generation manually.",
+                  flush=True)
+            self._pipeline_broadcast()
+            return False
+
+        print(f"[pipeline] cinematic: boards complete ({len(boards)} rendered) "
+              f"→ generating {len(motion)} clip(s) in Flow. This spends "
+              f"credits.", flush=True)
+        try:
+            self._broadcast(type="pipeline_phase", phase="clips",
+                            clips=len(motion),
+                            message=f"Boards approved — animating {len(motion)} act(s).")
+        except Exception:
+            pass
+        self._pipeline_broadcast()
+        _th.Thread(target=self._pipeline_generate_approved_video,
+                   daemon=True).start()
+        return True
+
+    def _pipeline_generate_approved_video(self) -> None:
+        """Video counterpart to _pipeline_generate_approved. Loops approved
+        prompts SEQUENTIALLY — Veo/Flow is serial and credit-metered, so
+        there's no burst parallelism — producing one MP4 per prompt via
+        _gen_video()'s text-to-video path. Clips land in
+        <pipeline>/Clips/Clip{N}.mp4; stage advances generating →
+        review_frames for user review (same stage keys as the image
+        pipeline, so the review/save spine is shared)."""
+        import time as _t
+        p = self._active_pipeline
+        if not p:
+            return
+        p.stage = "generating"
+        self._pipeline_broadcast()
+
+        pipeline_parent = p.parent_folder()
+        clips_dir = os.path.join(pipeline_parent, "Clips")
+        os.makedirs(clips_dir, exist_ok=True)
+        root = os.path.expanduser(
+            lotus_config.load()["image"].get("projects_root", "~/LotusAgent/Projects"))
+        vcfg = lotus_config.load().get("video", {})
+        aspect = vcfg.get("default_aspect", "9:16")
+        duration = vcfg.get("default_duration", "8s")
+
+        try:
+            import lotus_history
+            p.history_run_id = lotus_history.start_run(
+                name=p.name or p.id,
+                source_md=getattr(p, "source_md", ""),
+                parent_folder=os.path.basename(pipeline_parent),
+            )
+        except Exception as _e:
+            print(f"[vid-pipeline] history start_run failed: {_e}", flush=True)
+            p.history_run_id = None
+
+        self._stop_event.clear()
+
+        # ── Cinematic pairing (see CINEMATIC_FORMAT.md) ──────────────────
+        # A cinematic pack carries motion prompts (`### ACT PROMPT`) beside
+        # the keyframe stills. When any are present, ONLY those become
+        # clips: feeding a keyframe's own still-description to Veo would
+        # spend credits re-rendering a picture we already have on disk.
+        # Legacy packs have no motion rows, so `cinematic` stays False and
+        # every approved prompt remains eligible — old behaviour untouched.
+        motion_prompts = [pr for pr in p.prompts
+                          if (pr.get("kind") or "image") == "motion"]
+        cinematic = bool(motion_prompts)
+
+        # act number -> rendered keyframe path. Each frame knows its
+        # prompt_id; each prompt row knows its act. Only frames with a real
+        # file on disk qualify — a failed or unrendered board can't be
+        # animated, and we'd rather fall back to text->video than send Flow
+        # a missing path. Built BEFORE the dedupe below, which prunes
+        # p.frames.
+        keyframe_for_act: dict = {}
+        if cinematic:
+            act_of_prompt = {
+                str(pr["id"]): pr.get("act_number")
+                for pr in p.prompts
+                if (pr.get("kind") or "image") == "image"
+            }
+            for fr in p.frames:
+                if fr.get("media") == "video":
+                    continue
+                if fr.get("status") in ("failed", "rejected"):
+                    continue
+                act = act_of_prompt.get(str(fr.get("prompt_id")))
+                if act is None:
+                    continue
+                fp = fr.get("final_path")
+                try:
+                    if fp and os.path.exists(fp) and os.path.getsize(fp) > 4096:
+                        keyframe_for_act.setdefault(act, fp)
+                except Exception:
+                    pass
+            print(f"[vid-pipeline] cinematic mode: {len(motion_prompts)} motion "
+                  f"prompt(s); keyframes ready for acts "
+                  f"{sorted(keyframe_for_act) or 'none'}", flush=True)
+
+        def _eligible(pr: dict) -> bool:
+            """Which approved prompts become clips this run."""
+            if pr["status"] != "approved":
+                return False
+            return (not cinematic) or (pr.get("kind") or "image") == "motion"
+
+        # Dedupe stale frame entries by id before rebuild (mirror image path).
+        # Scoped to what we're actually rebuilding — in cinematic mode the
+        # keyframe frames must survive, they're the storyboard the user just
+        # approved (and the source images for this very stage).
+        about_to_build = {
+            f"f{i+1}" for i, pr in enumerate(p.prompts) if _eligible(pr)
+        }
+        if about_to_build:
+            p.frames = [f for f in p.frames if f.get("id") not in about_to_build]
+
+        # Pre-build one clip entry per approved prompt so the dashboard shows
+        # the full row count immediately. Resume: adopt an existing non-trivial
+        # MP4 whose provenance matches (or is missing) instead of re-spending
+        # credits.
+        to_render: list = []
+        clip_n = 0
+        for i, prompt in enumerate(p.prompts):
+            if not _eligible(prompt):
+                continue
+            clip_n += 1
+            target = os.path.join(clips_dir, f"Clip{clip_n}.mp4")
+            rel = os.path.relpath(target, root).replace(os.sep, "/")
+            url = "/projects/" + rel
+            fid = f"f{i+1}"
+            already = False
+            try:
+                if os.path.exists(target) and os.path.getsize(target) > 4096:
+                    recorded = lotus_pipelines_db.frame_provenance_hash(target)
+                    current = _prompt_text_hash(prompt["text"])
+                    if recorded == current or not recorded:
+                        already = True
+                        if not recorded:
+                            try:
+                                lotus_pipelines_db.record_frame(
+                                    target, current, pipeline_id=p.id, frame_id=fid)
+                            except Exception:
+                                pass
+            except Exception:
+                already = False
+            frame = {
+                "id": fid,
+                "prompt_id": prompt["id"],
+                "prompt_text": prompt["text"],
+                "section": "Clips",
+                "slide_idx": clip_n,
+                "final_path": target,
+                "final_url": url if already else None,
+                "temp_url": url if already else None,
+                "status": "pending_review" if already else "generating",
+                "resumed": already,
+                "source": None,
+                "error": None,
+                "media": "video",   # tells the dashboard to render a <video>
+            }
+            p.frames.append(frame)
+            if not already:
+                to_render.append((frame, prompt))
+        self._pipeline_broadcast()
+
+        # Sequential render. _gemini_lock serialises against image gen — both
+        # drive the same CDP Chrome.
+        engine = _resolve_video_pipeline_choice()
+        for frame, prompt in to_render:
+            if p.cancelled or self._stop_event.is_set():
+                break
+            target = frame["final_path"]
+            # Animate the APPROVED keyframe for this act when we have one, so
+            # the clip matches the board the user signed off on. Without a
+            # source image Flow reinvents the shot from scratch and the film
+            # loses continuity — but a missing keyframe is not fatal, we just
+            # degrade to text->video rather than skipping the act entirely.
+            src_img = keyframe_for_act.get(prompt.get("act_number")) if cinematic else None
+            if cinematic:
+                act_label = prompt.get("act_number")
+                if src_img:
+                    print(f"[vid-pipeline] act {act_label}: image→video from "
+                          f"{os.path.basename(src_img)}", flush=True)
+                else:
+                    print(f"[vid-pipeline] act {act_label}: no approved keyframe "
+                          f"— falling back to text→video", flush=True)
+            try:
+                with LotusPhase1._gemini_lock:
+                    path = _gen_video(prompt["text"], target, image_path=src_img,
+                                      aspect=aspect, duration=duration, verbose=True)
+            except Exception as e:
+                print(f"[vid-pipeline] gen error: {e}", flush=True)
+                path = None
+            if path:
+                rel = os.path.relpath(path, root).replace(os.sep, "/")
+                frame["final_path"] = path
+                frame["final_url"] = "/projects/" + rel
+                frame["temp_url"] = frame["final_url"]
+                frame["status"] = "pending_review"
+                frame["source"] = engine
+                try:
+                    lotus_pipelines_db.record_frame(
+                        path, _prompt_text_hash(prompt["text"]),
+                        pipeline_id=p.id, frame_id=frame["id"])
+                except Exception:
+                    pass
+            else:
+                frame["status"] = "failed"
+                frame["error"] = "video generation failed"
+                p.errors.append({
+                    "ts": _t.time(), "frame_id": frame["id"], "section": "Clips",
+                    "stage": "generating", "message": "video generation failed",
+                })
+            self._pipeline_broadcast()
+
+        if not p.cancelled:
+            p.stage = "review_frames"
+            self._pipeline_broadcast()
+        try:
+            if getattr(p, "history_run_id", None):
+                import lotus_history
+                lotus_history.end_run(p.history_run_id, status="completed")
+        except Exception:
+            pass
+
+    def _pipeline_generate_approved_flow_image(self) -> None:
+        """Flow Image counterpart to _pipeline_generate_approved_video. Loops
+        approved prompts SEQUENTIALLY producing one FULL-RES PNG per prompt via
+        Google Flow (Nano Banana) — flow_video.text_to_image(), forced through
+        Flow regardless of the global image.pipeline setting. Images land in
+        <pipeline>/Images/ImageN.png; stage advances generating →
+        review_frames. Image gen is free (0 credits)."""
+        import time as _t
+        import flow_video
+        p = self._active_pipeline
+        if not p:
+            return
+        p.stage = "generating"
+        self._pipeline_broadcast()
+
+        pipeline_parent = p.parent_folder()
+        images_dir = os.path.join(pipeline_parent, "Images")
+        os.makedirs(images_dir, exist_ok=True)
+        root = os.path.expanduser(
+            lotus_config.load()["image"].get("projects_root", "~/LotusAgent/Projects"))
+        # Aspect: 9:16 by default (Flow's strongest social format); overridable
+        # via video.default_aspect reuse or a future flow_image config key.
+        aspect = lotus_config.load().get("video", {}).get("default_aspect", "9:16")
+
+        try:
+            import lotus_history
+            p.history_run_id = lotus_history.start_run(
+                name=p.name or p.id,
+                source_md=getattr(p, "source_md", ""),
+                parent_folder=os.path.basename(pipeline_parent),
+            )
+        except Exception as _e:
+            print(f"[flowimg-pipeline] history start_run failed: {_e}", flush=True)
+            p.history_run_id = None
+
+        self._stop_event.clear()
+
+        about_to_build = {
+            f"f{i+1}" for i, pr in enumerate(p.prompts)
+            if pr["status"] == "approved"
+        }
+        if about_to_build:
+            p.frames = [f for f in p.frames if f.get("id") not in about_to_build]
+
+        to_render: list = []
+        img_n = 0
+        for i, prompt in enumerate(p.prompts):
+            if prompt["status"] != "approved":
+                continue
+            img_n += 1
+            target = os.path.join(images_dir, f"Image{img_n}.png")
+            rel = os.path.relpath(target, root).replace(os.sep, "/")
+            url = "/projects/" + rel
+            fid = f"f{i+1}"
+            already = False
+            try:
+                if os.path.exists(target) and os.path.getsize(target) > 4096:
+                    recorded = lotus_pipelines_db.frame_provenance_hash(target)
+                    current = _prompt_text_hash(prompt["text"])
+                    if recorded == current or not recorded:
+                        already = True
+                        if not recorded:
+                            try:
+                                lotus_pipelines_db.record_frame(
+                                    target, current, pipeline_id=p.id, frame_id=fid)
+                            except Exception:
+                                pass
+            except Exception:
+                already = False
+            frame = {
+                "id": fid,
+                "prompt_id": prompt["id"],
+                "prompt_text": prompt["text"],
+                "section": "Images",
+                "slide_idx": img_n,
+                "final_path": target,
+                "final_url": url if already else None,
+                "temp_url": url if already else None,
+                "status": "pending_review" if already else "generating",
+                "resumed": already,
+                "source": None,
+                "error": None,
+                "media": "image",
+            }
+            p.frames.append(frame)
+            if not already:
+                to_render.append((frame, prompt))
+        self._pipeline_broadcast()
+
+        for frame, prompt in to_render:
+            if p.cancelled or self._stop_event.is_set():
+                break
+            target = frame["final_path"]
+            try:
+                with LotusPhase1._gemini_lock:
+                    path = flow_video.text_to_image(
+                        prompt["text"], target, aspect=aspect, verbose=True)
+            except Exception as e:
+                print(f"[flowimg-pipeline] gen error: {e}", flush=True)
+                path = None
+            if path:
+                rel = os.path.relpath(path, root).replace(os.sep, "/")
+                cb = f"?t={int(_t.time())}"
+                frame["final_path"] = path
+                frame["final_url"] = "/projects/" + rel + cb
+                frame["temp_url"] = frame["final_url"]
+                frame["status"] = "pending_review"
+                frame["source"] = "flow"
+                try:
+                    lotus_pipelines_db.record_frame(
+                        path, _prompt_text_hash(prompt["text"]),
+                        pipeline_id=p.id, frame_id=frame["id"])
+                except Exception:
+                    pass
+            else:
+                frame["status"] = "failed"
+                frame["error"] = "flow image generation failed"
+                p.errors.append({
+                    "ts": _t.time(), "frame_id": frame["id"], "section": "Images",
+                    "stage": "generating", "message": "flow image generation failed",
+                })
+            self._pipeline_broadcast()
+
+        if not p.cancelled:
+            p.stage = "review_frames"
+            self._pipeline_broadcast()
+        try:
+            if getattr(p, "history_run_id", None):
+                import lotus_history
+                lotus_history.end_run(p.history_run_id, status="completed")
+        except Exception:
+            pass
 
     def _stage_pipeline_frame(self, pid: str, fname: str, src_path: str) -> tuple:
         """Move src into Projects/.pipeline/<pid>/<fname> so dashboard can render it
@@ -4832,6 +5567,13 @@ class LotusPhase1:
         fr["temp_url"]   = fr["final_url"]
         fr["status"]     = "pending_review"
         fr["source"]     = "manual"
+        try:
+            lotus_pipelines_db.record_frame(
+                final_path,
+                _prompt_text_hash(fr.get("prompt_text", "")),
+                pipeline_id=p.id, frame_id=fr.get("id"))
+        except Exception as _pe:
+            print(f"[pipeline] provenance record failed: {_pe}")
         fr["error"]      = None
         print(f"[pipeline] {frame_id} uploaded by user → {final_path}")
 
@@ -5465,6 +6207,13 @@ class LotusPhase1:
             fr2["status"]     = "pending_review"
             fr2["source"]     = "lotus"
             fr2["error"]      = None
+            try:
+                lotus_pipelines_db.record_frame(
+                    saved,
+                    _prompt_text_hash(fr2.get("prompt_text", "")),
+                    pipeline_id=p.id, frame_id=fr2.get("id"))
+            except Exception as _pe:
+                print(f"[pipeline] provenance record failed: {_pe}")
             print(f"[pipeline] retry saved {frame_id} → {saved}")
             # Re-submit to ReviewAgent — the retry's output is subject to the
             # same text-fidelity check as the original render.
@@ -5515,6 +6264,9 @@ class LotusPhase1:
             if approved:
                 p.stage = "save" if not all(f.get("final_path") for f in approved) else "done"
                 p.save_section = p.save_section or "Post1"
+                # Film: the boards are settled, so animate them. No-op for
+                # ordinary image packs and for the clips phase itself.
+                self._maybe_start_clips()
         self._pipeline_broadcast()
 
     def _pipeline_regen_frame(self, frame_id: str,
@@ -5557,20 +6309,119 @@ class LotusPhase1:
         frame["status"] = "generating"
         self._pipeline_broadcast()
 
+        # ── Flow Image pipeline: regenerate the PNG via flow_video.text_to_image ──
+        if getattr(p, "kind", "image") == "flow_image":
+            import shutil as _sh, time as _t, flow_video
+            aspect = lotus_config.load().get("video", {}).get("default_aspect", "9:16")
+            root = os.path.expanduser(
+                lotus_config.load()["image"].get("projects_root", "~/LotusAgent/Projects"))
+            final_path = frame.get("final_path")
+            _bak = None
+            if final_path and os.path.exists(final_path):
+                _bak = final_path + ".regenbak"
+                try: _sh.copy2(final_path, _bak)
+                except Exception: _bak = None
+            with LotusPhase1._gemini_lock:
+                path = flow_video.text_to_image(frame["prompt_text"], final_path,
+                                                aspect=aspect, verbose=True)
+            if path and os.path.exists(path) and os.path.getsize(path) > 4096:
+                if _bak:
+                    try: os.unlink(_bak)
+                    except Exception: pass
+                cb = f"?t={int(_t.time())}"
+                rel = os.path.relpath(path, root).replace(os.sep, "/")
+                frame["final_path"] = path
+                frame["final_url"] = "/projects/" + rel + cb
+                frame["temp_url"]  = "/projects/" + rel + cb
+                frame["status"]    = "pending_review"
+                frame["source"]    = "flow"
+                try:
+                    lotus_pipelines_db.record_frame(
+                        path, _prompt_text_hash(frame.get("prompt_text", "")),
+                        pipeline_id=p.id, frame_id=frame.get("id"))
+                except Exception:
+                    pass
+            else:
+                if _bak and os.path.exists(_bak):
+                    try: os.replace(_bak, final_path)
+                    except Exception: pass
+                frame["status"] = "failed"
+                frame["error"] = "flow image regeneration failed"
+            self._pipeline_broadcast()
+            return
+
+        # ── Video pipeline: regenerate the clip via _gen_video ──
+        # Branch off the image-specific full-res path below. Back up the old
+        # MP4, re-render to the same path; on failure restore the backup so a
+        # failed regen never destroys a good clip.
+        if getattr(p, "kind", "image") == "video" or frame.get("media") == "video":
+            import shutil as _sh, time as _t
+            vcfg = lotus_config.load().get("video", {})
+            aspect = vcfg.get("default_aspect", "9:16")
+            duration = vcfg.get("default_duration", "8s")
+            root = os.path.expanduser(
+                lotus_config.load()["image"].get("projects_root", "~/LotusAgent/Projects"))
+            final_path = frame.get("final_path")
+            _bak = None
+            if final_path and os.path.exists(final_path):
+                _bak = final_path + ".regenbak"
+                try: _sh.copy2(final_path, _bak)
+                except Exception: _bak = None
+            with LotusPhase1._gemini_lock:
+                path = _gen_video(frame["prompt_text"], final_path, image_path=None,
+                                  aspect=aspect, duration=duration, verbose=True)
+            if path and os.path.exists(path) and os.path.getsize(path) > 4096:
+                if _bak:
+                    try: os.unlink(_bak)
+                    except Exception: pass
+                cb = f"?t={int(_t.time())}"
+                rel = os.path.relpath(path, root).replace(os.sep, "/")
+                frame["final_path"] = path
+                frame["final_url"] = "/projects/" + rel + cb
+                frame["temp_url"]  = "/projects/" + rel + cb
+                frame["status"]    = "pending_review"
+                frame["source"]    = _resolve_video_pipeline_choice()
+                try:
+                    lotus_pipelines_db.record_frame(
+                        path, _prompt_text_hash(frame.get("prompt_text", "")),
+                        pipeline_id=p.id, frame_id=frame.get("id"))
+                except Exception:
+                    pass
+            else:
+                if _bak and os.path.exists(_bak):
+                    try: os.replace(_bak, final_path)
+                    except Exception: pass
+                frame["status"] = "failed"
+                frame["error"] = "video regeneration failed"
+            self._pipeline_broadcast()
+            return
+
         final_path = frame.get("final_path")
         if final_path:
-            # Delete the bad file first so Gemini's fresh image overwrites
-            # cleanly (also frees disk / prevents half-merge artefacts).
-            try:
-                if os.path.exists(final_path):
-                    os.unlink(final_path)
-                    print(f"[pipeline] removed bad frame: {final_path}")
-            except Exception as e:
-                print(f"[pipeline] could not delete {final_path}: {e}")
+            # Back the existing frame up FIRST, regenerate into the real path
+            # (engines infer aspect from the filename, so a temp name would
+            # mis-render), then keep the result ONLY if it's a real full-res
+            # image. On any failure — gen returned nothing, errored, or
+            # produced a low-res preview — restore the backup. A failed regen
+            # must NEVER destroy a good frame (that was the data-loss bug that
+            # wiped Frame6/7/10/11/12).
+            import shutil as _sh
+            _bak = None
+            if os.path.exists(final_path):
+                _bak = final_path + ".regenbak"
+                try:
+                    _sh.copy2(final_path, _bak)
+                except Exception:
+                    _bak = None
             with LotusPhase1._gemini_lock:
                 path = _gen_image(frame["prompt_text"], final_path, verbose=True)
-            if path and os.path.exists(path):
-                # Cache-bust both URLs so the <img> re-fetches.
+            got_fullres = bool(path and os.path.exists(path)
+                               and lotus_imgutil.is_fullres(path))
+            if got_fullres:
+                # Success — drop the backup and publish the fresh image.
+                if _bak:
+                    try: os.unlink(_bak)
+                    except Exception: pass
                 import time as _t
                 cb = f"?t={int(_t.time())}"
                 frame["final_path"] = path
@@ -5579,8 +6430,26 @@ class LotusPhase1:
                 frame["final_url"] = "/projects/" + rel + cb
                 frame["temp_url"]  = "/projects/" + rel + cb
                 frame["status"]    = "pending_review"
+                try:
+                    lotus_pipelines_db.record_frame(
+                        path,
+                        _prompt_text_hash(frame.get("prompt_text", "")),
+                        pipeline_id=p.id, frame_id=frame.get("id"))
+                except Exception as _pe:
+                    print(f"[pipeline] provenance record failed: {_pe}")
             else:
+                # Discard any low-res junk the regen wrote, then restore the
+                # original frame so nothing is lost; flag it for manual action.
+                if (path and os.path.exists(path)
+                        and not lotus_imgutil.is_fullres(path)):
+                    try: os.unlink(path)
+                    except Exception: pass
+                if _bak and os.path.exists(_bak):
+                    try: os.replace(_bak, final_path)
+                    except Exception: pass
                 frame["status"] = "failed"
+                print(f"[pipeline] regen did not yield full-res — kept the "
+                      f"existing frame, flagged failed for manual upload")
             self._pipeline_broadcast()
             return
 
@@ -5609,6 +6478,28 @@ class LotusPhase1:
         if not approved:
             self._pipeline_broadcast({"error": "No approved frames to save"})
             return
+        # Video / Flow-Image pipelines: media already rendered to its final
+        # location (<pipeline>/Clips/ClipN.mp4 or /Images/ImageN.png). "Save"
+        # just finalises — ensure provenance, mark done, archive. No temp→
+        # section move (that's the slot-based image path, and 'Clips'/'Images'
+        # aren't registered image sections).
+        if getattr(p, "kind", "image") in ("video", "flow_image"):
+            root = os.path.expanduser(
+                lotus_config.load()["image"].get("projects_root", "~/LotusAgent/Projects"))
+            for fr in approved:
+                fp = fr.get("final_path")
+                if fp and os.path.exists(fp):
+                    try:
+                        lotus_pipelines_db.record_frame(
+                            fp, _prompt_text_hash(fr.get("prompt_text", "")),
+                            pipeline_id=p.id, frame_id=fr.get("id"))
+                    except Exception:
+                        pass
+            p.stage = "done"
+            self._pipeline_broadcast()
+            self._pipeline_archive_rename(p)
+            self._submit_pipeline_for_archive()
+            return
         try:
             _ = lotus_config.section_folder(section)
         except Exception as e:
@@ -5623,6 +6514,13 @@ class LotusPhase1:
                 root = os.path.expanduser(lotus_config.load()["image"].get("projects_root", "~/LotusAgent/Projects"))
                 rel = os.path.relpath(dst, root).replace(os.sep, "/")
                 approved[0]["final_url"] = "/projects/" + rel
+                try:
+                    lotus_pipelines_db.record_frame(
+                        dst,
+                        _prompt_text_hash(approved[0].get("prompt_text", "")),
+                        pipeline_id=p.id, frame_id=approved[0].get("id"))
+                except Exception as _pe:
+                    print(f"[pipeline] provenance record failed: {_pe}")
                 p.stage = "done"
                 self._pipeline_broadcast()
                 # Auto-rename the parent folder so this run is preserved
@@ -5645,8 +6543,19 @@ class LotusPhase1:
             fr["final_path"] = final_path
             rel = os.path.relpath(final_path, root).replace(os.sep, "/")
             fr["final_url"] = "/projects/" + rel
+            try:
+                lotus_pipelines_db.record_frame(
+                    final_path,
+                    _prompt_text_hash(fr.get("prompt_text", "")),
+                    pipeline_id=p.id, frame_id=fr.get("id"))
+            except Exception as _pe:
+                print(f"[pipeline] provenance record failed: {_pe}")
         p.stage = "done"
         self._pipeline_broadcast()
+        # Film: boards are saved to their final paths — animate them before
+        # the folder rename below moves anything.
+        if self._maybe_start_clips():
+            return
         # Auto-rename today's parent folder so this completed run is
         # preserved under `<brand><date>_<pipeline>_<HHMMSS>/` and the
         # next pipeline gets a fresh folder. Runs BEFORE archive so the
@@ -5919,8 +6828,20 @@ class LotusPhase1:
         print("  Say 'exit' to quit")
         print("=" * 60 + "\n")
 
-        self.voice = VoiceEngine(tts_voice=TTS_VOICE)
-        self.voice.speak("LOTUS agent online. Say Lotus to wake me.")
+        try:
+            self.voice = VoiceEngine(tts_voice=TTS_VOICE)
+        except Exception as e:
+            # No microphone / no default input device (common on a Mac Studio
+            # with no built-in mic), or ambient calibration failed. Do NOT
+            # crash the process — the dashboard + WebSocket server are already
+            # running from __init__. Degrade to dashboard-only mode so the UI
+            # and content pipeline stay fully usable; only voice is disabled.
+            self._serve_dashboard_only(f"voice engine unavailable: {e}")
+            return
+        try:
+            self.voice.speak("LOTUS agent online. Say Lotus to wake me.")
+        except Exception:
+            pass
 
         import speech_recognition as sr
 
@@ -5968,10 +6889,16 @@ class LotusPhase1:
             return audio, (text or "").strip() or None
 
         # Open the mic once and loop forever inside the `with` block
-        with self.voice.microphone as mic_source:
-            self.voice.recognizer.adjust_for_ambient_noise(mic_source, duration=0.5)
-            print(f"✅  Stream open — energy threshold {self.voice.recognizer.energy_threshold:.0f}")
-            self._voice_main_loop(_read, mic_source, sr)
+        try:
+            with self.voice.microphone as mic_source:
+                self.voice.recognizer.adjust_for_ambient_noise(mic_source, duration=0.5)
+                print(f"✅  Stream open — energy threshold {self.voice.recognizer.energy_threshold:.0f}")
+                self._voice_main_loop(_read, mic_source, sr)
+        except (OSError, RuntimeError) as e:
+            # Mic vanished or couldn't be opened after init — same graceful
+            # degradation rather than taking the backend down.
+            self._serve_dashboard_only(f"microphone unavailable: {e}")
+            return
 
     def _voice_main_loop(self, read_fn, mic_source, sr) -> None:
         """Process phrases until KeyboardInterrupt. Extracted so run_voice's
@@ -6086,6 +7013,34 @@ class LotusPhase1:
             if alias in text_lower:
                 return alias
         return None
+
+    def _serve_dashboard_only(self, reason: str) -> None:
+        """Voice unavailable (e.g. no microphone / no default input device on a
+        Mac Studio) — keep the process alive in dashboard-only mode instead of
+        crashing. The dashboard + WebSocket server are already running from
+        __init__, so the UI and content pipeline stay fully usable; only voice
+        control is off. Exits cleanly on Ctrl-C / SIGTERM (Electron quit)."""
+        import time as _t
+        print(f"\n⚠️  Voice disabled — {reason}")
+        if not self.dashboard:
+            print("   Dashboard server isn't running either — nothing to "
+                  "serve. Exiting.")
+            return
+        print("   Continuing in dashboard-only mode — UI + content pipeline "
+              "fully available, voice control off.")
+        print("   📊 Dashboard: http://localhost:8766/dashboard.html")
+        try:
+            self._broadcast(type="controller_alert", ts=int(_t.time()),
+                            level="warn", agent="LOTUS",
+                            message=f"Voice disabled ({reason}). "
+                                    f"Dashboard-only mode.")
+        except Exception:
+            pass
+        try:
+            while True:
+                _t.sleep(3600)
+        except KeyboardInterrupt:
+            print("\n🔴 Agent offline.")
 
     def run_text(self):
         """Text-only mode for testing without mic."""

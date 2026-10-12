@@ -129,7 +129,17 @@ class DashboardServer:
         loop = asyncio.new_event_loop()
         self._loop = loop
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(self._ws_server())
+        try:
+            loop.run_until_complete(self._ws_server())
+        except OSError as e:
+            # EADDRINUSE: another (likely stale/orphaned) mother already owns
+            # this port. Fail LOUD — a silently-dead WS thread leaves the new
+            # mother half-started while the dashboard talks to the orphan,
+            # which is what made every dashboard action vanish with no error.
+            self._running = False
+            print(f"❌ WebSocket server could NOT bind ws://{self.bind}:{self.ws_port} — {e}\n"
+                  f"   Another LOTUS mother is probably already running. "
+                  f"Stop it (pkill -f 'lotus-mother') and relaunch.", flush=True)
 
     async def _ws_server(self) -> None:
         async def handler(websocket):
@@ -437,6 +447,57 @@ class DashboardServer:
                         self.end_headers()
                         self.wfile.write(body)
                         return
+                if self.path.startswith("/api/config/video-pipeline"):
+                    # Live switch of the video-gen engine (flow | grok).
+                    # Mirrors /api/config/pipeline for video; persists to
+                    # ~/.lotus_config.json under video.pipeline; takes effect
+                    # on the next _gen_video call (no restart needed).
+                    try:
+                        length = int(self.headers.get("Content-Length", "0"))
+                        raw = self.rfile.read(length) if length > 0 else b"{}"
+                        payload = json.loads(raw or b"{}")
+                        choice = (payload.get("pipeline") or "").strip().lower()
+                        valid = {"flow", "grok"}
+                        if choice not in valid:
+                            body = json.dumps({
+                                "error": f"pipeline must be one of {sorted(valid)}",
+                            }).encode()
+                            self.send_response(400)
+                            self.send_header("Content-Type", "application/json")
+                            self.send_header("Access-Control-Allow-Origin", "*")
+                            self.send_header("Content-Length", str(len(body)))
+                            self.end_headers()
+                            self.wfile.write(body)
+                            return
+                        import lotus_config as _lc
+                        cfg = _lc.load()
+                        cfg.setdefault("video", {})["pipeline"] = choice
+                        _lc.save(cfg)
+                        try:
+                            dashboard_self.broadcast({
+                                "type": "config_updated",
+                                "config": {"video": {"pipeline": choice}},
+                                "message": f"Video pipeline switched to {choice!r}",
+                            })
+                        except Exception:
+                            pass
+                        body = json.dumps({"ok": True, "pipeline": choice}).encode()
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+                    except Exception as e:
+                        body = json.dumps({"error": str(e)}).encode()
+                        self.send_response(500)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
                 if self.path.startswith("/api/config/pipeline"):
                     # Live switch of the image-gen pipeline (playwright |
                     # human | api). Persists to ~/.lotus_config.json so the
@@ -449,7 +510,11 @@ class DashboardServer:
                         raw = self.rfile.read(length) if length > 0 else b"{}"
                         payload = json.loads(raw or b"{}")
                         choice = (payload.get("pipeline") or "").strip().lower()
-                        valid = {"playwright", "human", "api"}
+                        # Must track agent_phase1._GEN_ENGINES. 'flow' (Google
+                        # Flow / Nano Banana, 2K) was added to the engine map
+                        # but never here, so the UI could not switch to it —
+                        # the endpoint 400'd on a perfectly valid engine.
+                        valid = {"playwright", "human", "api", "flow"}
                         if choice not in valid:
                             body = json.dumps({
                                 "error": f"pipeline must be one of {sorted(valid)}",
@@ -576,7 +641,9 @@ class DashboardServer:
                 if self.path.startswith("/api/config"):
                     try:
                         import lotus_config as _lc
-                        cfg = _lc.load()["image"]
+                        _full = _lc.load()
+                        cfg = _full["image"]
+                        vcfg = _full.get("video", {})
                         parent = _lc.parent_folder_for()
                         body = json.dumps({
                             "brand": cfg.get("brand", "Techengine"),
@@ -590,6 +657,15 @@ class DashboardServer:
                             "frame_ext": cfg.get("frame_ext", ".png"),
                             "active_section": cfg.get("active_section", "Post1"),
                             "pipeline": cfg.get("pipeline", "playwright"),
+                            # Video pipeline config for the Flow Video UI.
+                            "video": {
+                                "pipeline": vcfg.get("pipeline", "flow"),
+                                "engines": ["flow", "grok"],
+                                "default_aspect": vcfg.get("default_aspect", "9:16"),
+                                "default_duration": vcfg.get("default_duration", "8s"),
+                                "durations": ["4s", "6s", "8s", "10s"],
+                                "aspects": ["9:16", "16:9"],
+                            },
                         }).encode()
                         self.send_response(200)
                         self.send_header("Content-Type", "application/json")
@@ -772,9 +848,9 @@ class DashboardServer:
                         # overview can show approved/pending/rejected at a
                         # glance without a second round-trip per card.
                         for r in rows:
-                            sh = r.get("source_hash")
+                            pid = r.get("id")
                             r["prompt_counts"] = (
-                                _prdb.count_by_status(sh) if sh
+                                _prdb.count_by_status(pid) if pid
                                 else {"pending": 0, "approved": 0, "rejected": 0}
                             )
                             r["source_basename"] = (
@@ -865,7 +941,15 @@ class DashboardServer:
                 return super().do_GET()
 
             def end_headers(self):
-                if self.path.startswith("/projects/"):
+                # Never cache the React HTML shell: its <script src> points at a
+                # per-build hashed bundle (index-<hash>.js). If Electron/Chrome
+                # caches the shell, after a rebuild it keeps requesting the OLD
+                # hash — which 404s — and #root never mounts (blank window).
+                # The hashed assets themselves are content-addressed, so they
+                # stay cacheable. /projects/ images regenerate in place, so they
+                # also must not cache.
+                _p = self.path.split("?", 1)[0].lower()
+                if self.path.startswith("/projects/") or _p.endswith(".html"):
                     self.send_header("Cache-Control", "no-store")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 super().end_headers()
@@ -873,7 +957,16 @@ class DashboardServer:
             def log_message(self, format, *args):
                 pass  # suppress access log
 
-        server = HTTPServer((self.bind, self.http_port), Handler)
+        try:
+            server = HTTPServer((self.bind, self.http_port), Handler)
+        except OSError as e:
+            # EADDRINUSE — see _run_ws. Fail loud rather than die silently in
+            # this daemon thread (a stale/orphaned mother holds the port).
+            self._running = False
+            print(f"❌ HTTP/dashboard server could NOT bind http://{self.bind}:{self.http_port} — {e}\n"
+                  f"   Another LOTUS mother is probably already running. "
+                  f"Stop it (pkill -f 'lotus-mother') and relaunch.", flush=True)
+            return
         # Make the DashboardServer reachable from inside Handler via
         # `self.server.lotus` — used by /api/queue to call the live
         # snapshot callback the agent registered on us.

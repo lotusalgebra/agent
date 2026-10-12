@@ -24,7 +24,18 @@ from typing import Callable, Optional
 
 DEFAULT_CDP_PORT = 9222
 DEFAULT_PROFILE_DIR = Path.home() / ".lotus_auth" / "chrome_cdp_profile"
-GEMINI_START_URL = "https://gemini.google.com/app"
+def _authuser() -> int:
+    """Google account index for this Chrome profile (see
+    lotus_config.google_authuser). Pinned so the startup tab — and the
+    sign-in check built on it — target the same account the bots drive."""
+    try:
+        import lotus_config
+        return lotus_config.google_authuser()
+    except Exception:
+        return 0
+
+
+GEMINI_START_URL = f"https://gemini.google.com/u/{_authuser()}/app"
 SIGNIN_TIMEOUT_S = 600  # 10 min for the user to sign in before we give up
 
 
@@ -109,7 +120,11 @@ def _gemini_tab_state(port: int) -> Optional[bool]:
         if tab.get("type") != "page":
             continue
         url = (tab.get("url") or "").lower()
-        if "gemini.google.com/app" in url and "accounts.google.com" not in url:
+        # Account-agnostic: a multi-account profile serves Gemini at
+        # /u/<N>/app, so matching the literal "gemini.google.com/app" would
+        # miss every account but the first and hang forever at awaiting_signin.
+        if ("gemini.google.com" in url and "/app" in url
+                and "accounts.google.com" not in url):
             return True
         if "accounts.google.com" in url and "service=cl" in url:
             saw_signin = True
@@ -161,6 +176,46 @@ def _clear_singleton_locks(profile_dir: Path) -> None:
             pass  # if Chrome itself is using it, launch will surface the error
 
 
+def _ensure_download_prefs(profile_dir: Path) -> None:
+    """Stopgap safety net: force the CDP Chrome profile to auto-save downloads
+    without ever showing a native "Save As" dialog, into a single known staging
+    folder.
+
+    The image bots capture downloads via Playwright's expect_download, so a
+    correctly-captured frame never reaches Chrome's native download handler.
+    But if a click ever leaks (e.g. a Gemini UI change moves the download
+    control again), Chrome falls back to its own handler — and with the
+    profile's default settings that pops a Save-As prompt and dumps the file
+    into the last-used folder. Pinning prompt_for_download=false + a fixed
+    default_directory means any leaked download lands silently in
+    ~/.lotus_auth/download_staging instead of blocking the pipeline on a modal.
+
+    Written pre-launch (the profile isn't locked yet). No-op + never raises if
+    anything goes wrong — a stopgap must not break startup. Only affects Chrome
+    instances we launch; a reused live session keeps its current settings.
+    """
+    try:
+        import json
+        staging = profile_dir.parent / "download_staging"
+        staging.mkdir(parents=True, exist_ok=True)
+        prefs_path = profile_dir / "Default" / "Preferences"
+        prefs: dict = {}
+        if prefs_path.exists():
+            try:
+                prefs = json.loads(prefs_path.read_text(encoding="utf-8"))
+            except Exception:
+                prefs = {}
+        dl = prefs.setdefault("download", {})
+        dl["prompt_for_download"] = False
+        dl["default_directory"] = str(staging)
+        dl["directory_upgrade"] = True
+        prefs.setdefault("savefile", {})["default_directory"] = str(staging)
+        prefs_path.parent.mkdir(parents=True, exist_ok=True)
+        prefs_path.write_text(json.dumps(prefs), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def launch_chrome(profile_dir: Path = DEFAULT_PROFILE_DIR,
                   port: int = DEFAULT_CDP_PORT,
                   start_url: str = GEMINI_START_URL) -> subprocess.Popen:
@@ -170,6 +225,7 @@ def launch_chrome(profile_dir: Path = DEFAULT_PROFILE_DIR,
     detects the live CDP and reuses it.
     """
     profile_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_download_prefs(profile_dir)
     _clear_singleton_locks(profile_dir)
     chrome = _find_chrome()
     args = [
@@ -241,8 +297,14 @@ _CRBROWSER_PATCHED = (
 # patched form differs from the unpatched only by the appended `.catch`,
 # so we derive it to guarantee they stay in lockstep.
 _COREBUNDLE_REL = ("driver", "package", "lib", "coreBundle.js")
+# Start the match AT `this._browser._session.send(...)` rather than at the
+# `promises.push(` / `promises2.push(` prefix — Playwright renames that local
+# across versions (1.60: `promises.push`; 1.62: `promises2.push`), and pinning
+# to it broke the patch on every minor upgrade. The trailing `}));` (which the
+# `.catch` wrapper attaches to) is unchanged, so the derived patched form still
+# lines up.
 _COREBUNDLE_UNPATCHED = (
-    'promises.push(this._browser._session.send("Browser.setDownloadBehavior", {\n'
+    'this._browser._session.send("Browser.setDownloadBehavior", {\n'
     '            behavior: this._options.acceptDownloads === "accept" ? "allowAndName" : "deny",\n'
     '            browserContextId: this._browserContextId,\n'
     '            downloadPath: this._browser.options.downloadsPath,\n'

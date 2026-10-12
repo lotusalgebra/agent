@@ -57,13 +57,22 @@ def _init() -> None:
                 cancelled    INTEGER NOT NULL DEFAULT 0,
                 created_at   REAL NOT NULL,
                 updated_at   REAL NOT NULL,
-                folder_name  TEXT
+                folder_name  TEXT,
+                kind         TEXT NOT NULL DEFAULT 'image'
             );
 
             CREATE INDEX IF NOT EXISTS idx_pipelines_stage
                 ON pipelines(stage, cancelled);
             CREATE INDEX IF NOT EXISTS idx_pipelines_created
                 ON pipelines(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS frame_provenance (
+                final_path       TEXT PRIMARY KEY,
+                prompt_text_hash TEXT NOT NULL,
+                pipeline_id      TEXT,
+                frame_id         TEXT,
+                written_at       REAL NOT NULL
+            );
             """
         )
         # Backfill the column on DBs that pre-date A10. Failure to add (e.g.
@@ -71,6 +80,13 @@ def _init() -> None:
         # ignore.
         try:
             c.execute("ALTER TABLE pipelines ADD COLUMN folder_name TEXT")
+        except Exception:
+            pass
+        # Backfill `kind` (image|video) on DBs that pre-date the video
+        # pipeline. Existing rows default to 'image'. Safe to ignore if the
+        # column already exists from the CREATE TABLE above.
+        try:
+            c.execute("ALTER TABLE pipelines ADD COLUMN kind TEXT NOT NULL DEFAULT 'image'")
         except Exception:
             pass
 
@@ -85,6 +101,10 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
         folder_name = row["folder_name"]
     except Exception:
         folder_name = None
+    try:
+        kind = row["kind"] or "image"
+    except Exception:
+        kind = "image"
     return {
         "id":          row["id"],
         "name":        row["name"],
@@ -96,6 +116,7 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
         "created_at":  row["created_at"],
         "updated_at":  row["updated_at"],
         "folder_name": folder_name,
+        "kind":        kind,
     }
 
 
@@ -121,14 +142,15 @@ def upsert(p: dict) -> None:
         float(p.get("created_at") or now),
         now,
         p.get("folder_name"),
+        p.get("kind") or "image",
     )
     with _lock, _conn() as c:
         c.execute(
             """
             INSERT INTO pipelines
               (id, name, source_md, source_hash, stage, paused, cancelled,
-               created_at, updated_at, folder_name)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
+               created_at, updated_at, folder_name, kind)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
               name        = excluded.name,
               source_md   = excluded.source_md,
@@ -137,7 +159,8 @@ def upsert(p: dict) -> None:
               paused      = excluded.paused,
               cancelled   = excluded.cancelled,
               updated_at  = excluded.updated_at,
-              folder_name = COALESCE(excluded.folder_name, pipelines.folder_name)
+              folder_name = COALESCE(excluded.folder_name, pipelines.folder_name),
+              kind        = excluded.kind
             """,
             row,
         )
@@ -205,3 +228,47 @@ def delete(pipeline_id: str) -> None:
         return
     with _lock, _conn() as c:
         c.execute("DELETE FROM pipelines WHERE id = ?", (pipeline_id,))
+
+
+def record_frame(final_path: str,
+                 prompt_text_hash: str,
+                 pipeline_id: Optional[str] = None,
+                 frame_id: Optional[str] = None) -> None:
+    """Persist that `final_path` on disk was written from a prompt whose text
+    hashes to `prompt_text_hash`. Last writer wins (matches on-disk overwrite
+    semantics). Called from every successful frame-save site so a later
+    pipeline can verify provenance before adopting an existing file as
+    'already done' — see frame_provenance_hash."""
+    if not final_path or not prompt_text_hash:
+        return
+    now = datetime.utcnow().timestamp()
+    with _lock, _conn() as c:
+        c.execute(
+            """
+            INSERT INTO frame_provenance
+              (final_path, prompt_text_hash, pipeline_id, frame_id, written_at)
+            VALUES (?,?,?,?,?)
+            ON CONFLICT(final_path) DO UPDATE SET
+              prompt_text_hash = excluded.prompt_text_hash,
+              pipeline_id      = excluded.pipeline_id,
+              frame_id         = excluded.frame_id,
+              written_at       = excluded.written_at
+            """,
+            (final_path, prompt_text_hash, pipeline_id, frame_id, now),
+        )
+
+
+def frame_provenance_hash(final_path: str) -> Optional[str]:
+    """Return the prompt_text_hash recorded for `final_path`, or None if no
+    record exists (e.g. legacy frame from before provenance was tracked).
+    Callers that get None must treat the existing file as untrusted and
+    re-render."""
+    if not final_path:
+        return None
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "SELECT prompt_text_hash FROM frame_provenance WHERE final_path = ?",
+            (final_path,),
+        )
+        row = cur.fetchone()
+        return row["prompt_text_hash"] if row else None

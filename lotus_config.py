@@ -60,6 +60,19 @@ def _default_config() -> dict:
             # with the LOTUS_GEN_IMAGE_PIPELINE env var at boot.
             "pipeline": "playwright",
         },
+        "video": {
+            # Primary video-gen engine for the Flow Video pipeline. Fall-back
+            # chain in _gen_video runs the other as backup. Valid values:
+            #   "flow" — flow_video.py (Google Flow / Veo, text- & image-to-video)
+            #   "grok" — grok_video.py (grok.com/imagine, image-to-video only)
+            # Set via dashboard / POST /api/config/video-pipeline at runtime,
+            # or with the LOTUS_GEN_VIDEO_PIPELINE env var at boot.
+            "pipeline": "flow",
+            "default_aspect": "9:16",       # Flow video supports 9:16 or 16:9
+            "default_duration": "8s",       # 4s | 6s | 8s | 10s
+            "clip_ext": ".mp4",
+            "clip_prefix": "Clip",
+        },
         "ollama": {
             # The Gemma variant LOTUS uses for every local-brain call
             # (reviewer, parser, archiver summary, controller patterns).
@@ -88,6 +101,36 @@ def load() -> dict:
 
 def save(cfg: dict) -> None:
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+
+def google_authuser() -> int:
+    """Which Google account the browser bots should drive.
+
+    The LOTUS Chrome profile can hold several signed-in Google accounts.
+    Google addresses them by index: `gemini.google.com/u/<N>/app` and
+    `labs.google/fx/tools/flow?authuser=<N>`. Index 0 is whichever account
+    signed in first, which is NOT necessarily the one holding the paid
+    plan — and Veo/Flow credits belong to the *account*, so pointing the
+    bots at the wrong index silently spends the wrong balance (or finds
+    none).
+
+    Resolution order: LOTUS_GOOGLE_AUTHUSER env var, then `google.authuser`
+    in ~/.lotus_config.json, else 0 (previous hardcoded behaviour).
+    """
+    env = os.environ.get("LOTUS_GOOGLE_AUTHUSER", "").strip()
+    if env.isdigit():
+        return int(env)
+    try:
+        v = load().get("google", {}).get("authuser")
+        if isinstance(v, bool):
+            return 0
+        if isinstance(v, int) and v >= 0:
+            return v
+        if isinstance(v, str) and v.strip().isdigit():
+            return int(v.strip())
+    except Exception:
+        pass
+    return 0
 
 
 # ── Parent folder (brand + date) ───────────────────────────────────────────

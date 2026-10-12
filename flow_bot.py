@@ -59,7 +59,18 @@ from typing import Optional
 # CDP URL of the real Chrome the preflight launched (or attached to).
 # Honor the env var the rest of LOTUS uses; default to the documented port.
 _CDP_URL = os.environ.get("LOTUS_CDP_URL", "http://127.0.0.1:9222")
-_FLOW_URL = "https://labs.google/fx/tools/flow"
+def _authuser() -> int:
+    """Google account index (see lotus_config.google_authuser)."""
+    try:
+        import lotus_config
+        return lotus_config.google_authuser()
+    except Exception:
+        return 0
+
+
+_AU = _authuser()
+_FLOW_URL = ("https://labs.google/fx/tools/flow"
+             + (f"?authuser={_AU}" if _AU else ""))
 
 # Generation timeout. Nano Banana 2 usually delivers in 15-40s but we
 # allow plenty of margin for slow runs.
@@ -404,9 +415,23 @@ async def _download_via_detail_view(page, new_src: str, save_to: str,
             if verbose: print("[flow] clicked Download → Original size")
         dl = await dl_info.value
         await dl.save_as(save_to)
+        # Guard against saving a downscaled preview instead of the original.
+        # "Download → Original size" should yield full-res, but if that menu
+        # interaction partially fails we can land a thumbnail. Reject anything
+        # below full-res so the gen-chain falls through to playwright/api (or
+        # the frame is flagged) instead of shipping a low-res image.
+        import lotus_imgutil
+        edge = lotus_imgutil.long_edge(save_to)
+        if edge < lotus_imgutil.MIN_FULLRES_LONG_EDGE:
+            try:
+                os.unlink(save_to)
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"flow download returned low-res ({edge}px long edge) — rejecting")
         if verbose:
             size = os.path.getsize(save_to)
-            print(f"[flow] saved → {save_to} ({size} bytes)")
+            print(f"[flow] saved → {save_to} ({edge}px long edge, {size} bytes)")
         return save_to
     finally:
         # Close detail view so subsequent renders start cleanly

@@ -225,7 +225,7 @@ Repo: **github.com/lotusalgebra/agent** (first push 2026-05-05). Branch model:
 
 - `tools.py::tool_run_command` blocks a hardcoded destructive-command list (`rm -rf /`, `mkfs`, `dd if=`, fork bomb, etc.), enforces 30 s timeout + 3000-char output cap. Extend the blocklist if you find gaps; don't weaken it.
 - `pyautogui.FAILSAFE = True` set in `tools.py::_init_screen` and `browser.py` — slamming the mouse into a screen corner aborts automation. Preserve this.
-- `lotus_preflight.ensure_crBrowser_patch` auto-reapplies the `Browser.setDownloadBehavior` `.catch(() => {})` wrapper to `venv/.../chromium/crBrowser.js` if `pip install -U playwright` clobbers it. Idempotent — keep, otherwise downloads fail after every Playwright upgrade.
+- `lotus_preflight.ensure_crBrowser_patch` auto-reapplies the `Browser.setDownloadBehavior` `.catch(() => {})` wrapper if `pip install -U playwright` clobbers it. Playwright relocated this code across versions, so it patches **whichever file is present**: `server/chromium/crBrowser.js` (≤ 1.59, pretty-printed) and/or the minified `driver/package/lib/coreBundle.js` (1.60+). Idempotent (checks for a marker comment) — keep, otherwise CDP downloads fail after every Playwright upgrade.
 - `gemini_bot._connect_cdp_with_retry` retries `connect_over_cdp` once after tearing down the Playwright instance, so transient CDP-attach failures don't kill a render burst.
 - `lotus_recorder.py` is the engine; pair any recording with a visible REC indicator in the UI — never hide recording from the user.
 - Conversation history in `agent.py` auto-trims to last 30 messages after reaching 40 to keep token usage bounded.

@@ -3,6 +3,10 @@
 # Ollama client (for local Gemma 4)
 requests>=2.31.0
 
+# Claude API (lotus_llm.py) + MCP client for the Instagram/YouTube servers
+anthropic==1.13.0
+mcp==2.3.0
+
 # Voice — Speech-to-Text
 SpeechRecognition>=3.10.0
 openai-whisper>=20231117

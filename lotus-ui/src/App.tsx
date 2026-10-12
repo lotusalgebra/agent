@@ -36,6 +36,7 @@ interface Frame  {
   section?: string;                           // Post1..PostN, for label on upload tooltip
   slide_idx?: number;
   retry_count?: number;                       // ReviewAgent's 3-attempt retry counter
+  media?: 'image' | 'video';                  // 'video' → render a <video> clip, not <img>
 }
 interface AgentHealth {
   name: string;
@@ -69,6 +70,7 @@ interface PipelineSummary {
   statuses: Record<string, number>;
   by_source: Record<string, number>;
   created_at?: number;
+  pipeline_type?: 'image' | 'video' | 'flow_image';   // pipeline kind
 }
 interface PipelineError {
   ts: number;                       // unix seconds
@@ -80,6 +82,7 @@ interface PipelineError {
 interface PipelineState {
   id: string; name: string; stage: StageKey;
   source_md?: string;
+  pipeline_type?: 'image' | 'video' | 'flow_image';   // pipeline kind
   prompts: Prompt[]; frames: Frame[];
   save_section?: string; processing?: boolean; processing_label?: string; error?: string;
   created_at?: number | string;
@@ -147,6 +150,21 @@ const STAGES: { key: StageKey; title: string; desc: string; IconKey: string; col
   { key:'save',           title:'Save',          desc:'Drop approved frames into the destination folder.', IconKey:'Archive',       color:'accent' },
   { key:'done',           title:'Complete',      desc:'All frames saved with the correct hierarchy.',      IconKey:'CircleCheck',   color:'green'  },
 ];
+
+// Flow Video pipeline stage graph — SAME keys as STAGES (the backend FSM is
+// shared), only labels/descriptions differ so the ReactFlow view reads as a
+// video flow. PipelineCanvas picks this when pipeline_type === 'video'.
+const VIDEO_STAGES: { key: StageKey; title: string; desc: string; IconKey: string; color: string }[] = [
+  { key:'ask_location',   title:'Source',        desc:'Pick the markdown file with your video prompts.',      IconKey:'FileText',    color:'cyan'   },
+  { key:'review_prompts', title:'Prompts',       desc:'Verify each prompt, then click Start Generation.',     IconKey:'ListChecks',  color:'amber'  },
+  { key:'generating',     title:'Render Clips',  desc:'Flow / Veo renders a clip from each prompt.',          IconKey:'Sparkles',    color:'violet' },
+  { key:'review_frames',  title:'Review Clips',  desc:'Play, approve, deny, or re-render each clip.',         IconKey:'LayoutGrid',  color:'violet' },
+  { key:'save',           title:'Save',          desc:'Finalise approved clips in the destination folder.',   IconKey:'Archive',     color:'accent' },
+  { key:'done',           title:'Complete',      desc:'All clips saved.',                                     IconKey:'CircleCheck', color:'green'  },
+];
+
+// Convenience: the correct stage list for a pipeline's type.
+const stagesFor = (t?: string) => (t === 'video' ? VIDEO_STAGES : STAGES);
 
 const COLOR_HEX: Record<string, string> = {
   cyan: '#00e5ff', amber: '#fbbf24', violet: '#a78bfa', accent: '#ff6b35', green: '#10b981',
@@ -580,10 +598,12 @@ function PipelineCanvas({ pipeline, selected, onSelect, onCancel, onEmergencySto
   const resetLayout = useCallback(() => setNodePositions({}), []);
 
   const { nodes, edges } = useMemo(() => {
-    const activeIdx = pipeline ? STAGES.findIndex(s => s.key === pipeline.stage) : -1;
+    const STG = stagesFor(pipeline?.pipeline_type);
+    const unit = pipeline?.pipeline_type === 'video' ? 'clips' : 'frames';
+    const activeIdx = pipeline ? STG.findIndex(s => s.key === pipeline.stage) : -1;
     const allDone = pipeline?.stage === 'done';
 
-    const nodes: Node<NodeData>[] = STAGES.map((s, i) => {
+    const nodes: Node<NodeData>[] = STG.map((s, i) => {
       const state: NodeData['state'] = i === activeIdx ? 'active'
                                     : (i < activeIdx || allDone) ? 'done' : 'pending';
       let footer = '';
@@ -598,7 +618,7 @@ function PipelineCanvas({ pipeline, selected, onSelect, onCancel, onEmergencySto
         } else if (s.key === 'generating') {
           const gen = pipeline.frames.filter(f => f.temp_url || f.final_url).length;
           const total = pipeline.prompts.length || pipeline.frames.length;
-          footer = `${gen}/${total} frames rendered`;
+          footer = `${gen}/${total} ${unit} rendered`;
           if (state === 'active' && pipeline.prompts.length) progress = gen / pipeline.prompts.length;
           // Live ETA — (elapsed / done) × remaining; only once we have >=2
           // samples so the first render doesn't produce a wild estimate.
@@ -613,7 +633,7 @@ function PipelineCanvas({ pipeline, selected, onSelect, onCancel, onEmergencySto
             }
           }
         } else if (s.key === 'review_frames') {
-          footer = `${pipeline.frames.length} frames · ${approved} approved`;
+          footer = `${pipeline.frames.length} ${unit} · ${approved} approved`;
           if (state === 'active' && pipeline.frames.length) progress = approved / pipeline.frames.length;
         } else if (s.key === 'save') {
           footer = pipeline.save_section ? `→ ${pipeline.save_section}` : '(choose destination)';
@@ -640,19 +660,19 @@ function PipelineCanvas({ pipeline, selected, onSelect, onCancel, onEmergencySto
     });
 
     const edges: Edge[] = [];
-    for (let i = 0; i < STAGES.length - 1; i++) {
+    for (let i = 0; i < STG.length - 1; i++) {
       const done = i < activeIdx || allDone;
       const active = i === activeIdx - 1 && !allDone;
       edges.push({
-        id: `${STAGES[i].key}-${STAGES[i+1].key}`,
-        source: STAGES[i].key, target: STAGES[i+1].key,
+        id: `${STG[i].key}-${STG[i+1].key}`,
+        source: STG[i].key, target: STG[i+1].key,
         type: 'smoothstep',
         className: done ? 'done' : active ? 'active' : 'pending',
         markerEnd: { type: 'arrowclosed' as any, width: 18, height: 18 },
       });
     }
     return { nodes, edges };
-  }, [pipeline, selected, onSelect, stageElapsed, nodePositions]);
+  }, [pipeline, selected, onSelect, stageElapsed, nodePositions, pipeline?.pipeline_type]);
 
   return (
     <div style={{ width: '100%', height: '100%', position: 'relative' }}>
@@ -719,7 +739,7 @@ interface UploadClassification {
   verdict: 'yes' | 'no' | 'uncertain';
   confidence: number;
   reason: string;
-  source: 'heuristic' | 'gemma' | 'fallback';
+  source: 'heuristic' | 'claude' | 'gemma' | 'fallback';
 }
 
 function SourceDropzone({ onPath, currentPath }: { onPath: (p: string) => void; currentPath?: string }) {
@@ -1175,7 +1195,8 @@ function StageDetail({ pipeline, selected, config, onAction, onClose, alerts, on
   }, [pipeline, selected, lightboxFrame, onAction, onClose]);
 
   if (!pipeline || !selected) return null;
-  const meta = STAGES.find(s => s.key === selected)!;
+  const isVideo = pipeline.pipeline_type === 'video';
+  const meta = stagesFor(pipeline.pipeline_type).find(s => s.key === selected)!;
   const accent = COLOR_HEX[meta.color];
 
   // Filter frames per tab so long lists stay manageable.
@@ -2154,7 +2175,14 @@ function StageDetail({ pipeline, selected, config, onAction, onClose, alerts, on
                       (e.currentTarget as HTMLElement).style.borderColor = withAlpha(badgeColor, 0.22);
                     }}>
                     {url ? (
-                      <img src={url} alt="" style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: 4 }} />
+                      (isVideo || f.media === 'video') ? (
+                        <video src={url} muted loop playsInline preload="metadata"
+                          onMouseEnter={(e) => { (e.currentTarget as HTMLVideoElement).play().catch(()=>{}); }}
+                          onMouseLeave={(e) => { const v = e.currentTarget as HTMLVideoElement; v.pause(); v.currentTime = 0; }}
+                          style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: 4, background: '#000' }} />
+                      ) : (
+                        <img src={url} alt="" style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: 4 }} />
+                      )
                     ) : (
                       <div style={{
                         width: '100%', aspectRatio: '1', borderRadius: 4,
@@ -2263,6 +2291,32 @@ function StageDetail({ pipeline, selected, config, onAction, onClose, alerts, on
                                    background: 'rgba(127,138,163,0.18)', color: '#7f8aa3',
                                    border: '1px solid rgba(127,138,163,0.3)', cursor: 'pointer',
                                    textTransform: 'uppercase', letterSpacing: '0.08em' }}>⊝ Skip</button>
+                      </div>
+                    )}
+                    {/* Manual upload is ALWAYS available (not just for failed
+                        frames) so a low-res or unwanted frame in any state —
+                        generating, pending_review, approved — can be replaced
+                        with a hand-picked full-res image. Failed frames already
+                        carry their own Upload in the recovery toolbar above. */}
+                    {f.status !== 'failed' && (
+                      <div style={{ display: 'flex', marginTop: 6 }}>
+                        <button onClick={(e) => {
+                          e.stopPropagation();
+                          const input = document.createElement('input');
+                          input.type = 'file';
+                          input.accept = 'image/*';
+                          input.onchange = async (evt: Event) => {
+                            const file = (evt.target as HTMLInputElement).files?.[0];
+                            if (!file) return;
+                            await tryUpload(f.id, file);
+                          };
+                          input.click();
+                        }}
+                          title={`Upload a full-res image manually — saves to ${f.section}/Frame${(f.slide_idx ?? 0) + 1}.png (you'll get an Overwrite / Save-As prompt if it already exists)`}
+                          style={{ flex: 1, fontSize: 9, padding: '4px 0', borderRadius: 4, fontWeight: 700,
+                                   background: 'rgba(167,139,250,0.12)', color: '#a78bfa',
+                                   border: '1px solid rgba(167,139,250,0.28)', cursor: 'pointer',
+                                   textTransform: 'uppercase', letterSpacing: '0.08em' }}>↑ Upload</button>
                       </div>
                     )}
                   </div>
@@ -2425,9 +2479,15 @@ function StageDetail({ pipeline, selected, config, onAction, onClose, alerts, on
                 <div className="relative rounded-2xl overflow-hidden"
                   style={{ boxShadow: `0 30px 80px ${withAlpha(badgeColor, 0.25)}` }}>
                   {url ? (
-                    <img src={url} alt={`Frame ${lightboxFrame+1}`}
-                      className="w-full h-full object-contain"
-                      style={{ maxHeight: '82vh', background: '#05070d' }} />
+                    (isVideo || f.media === 'video') ? (
+                      <video src={url} controls autoPlay loop playsInline
+                        className="w-full h-full object-contain"
+                        style={{ maxHeight: '82vh', background: '#05070d' }} />
+                    ) : (
+                      <img src={url} alt={`Frame ${lightboxFrame+1}`}
+                        className="w-full h-full object-contain"
+                        style={{ maxHeight: '82vh', background: '#05070d' }} />
+                    )
                   ) : (
                     <div className="flex items-center justify-center w-[640px] h-[800px] bg-[#05070d] text-[#7f8aa3]">
                       <ImageOff size={48} />
@@ -4189,12 +4249,13 @@ interface PipelineRow {
   prompt_counts: { pending: number; approved: number; rejected: number };
   folder_name: string | null;   // A10 — null on legacy pipelines (pre-A10),
                                 // they fall back to <brand><MMDDYYYY>
+  kind?: 'image' | 'video' | 'flow_image';   // pipeline type; absent on legacy rows → image
 }
 
 function PipelinesOverview({ onFocus, onReopen, onCreate, onDelete, onBackfill, liveIds }: {
   onFocus: (id: string) => void;
   onReopen: (id: string) => void;
-  onCreate: (name: string) => void;
+  onCreate: (name: string, kind: 'image' | 'flow_image' | 'video') => void;
   onDelete: (id: string, name: string) => void;
   onBackfill: (id: string, name: string) => void;
   liveIds: Set<string>;
@@ -4204,6 +4265,12 @@ function PipelinesOverview({ onFocus, onReopen, onCreate, onDelete, onBackfill, 
   const [err, setErr] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState('');
+  // Which kind of pipeline a "New …" button creates. 'image' = the previous
+  // image content pipeline (_gen_image / Post-Reel slots); 'flow_image' =
+  // Google Flow / Nano Banana 2K; 'video' = Flow / Veo clips.
+  const [newKind, setNewKind] = useState<'image' | 'flow_image' | 'video'>('flow_image');
+  const KIND_TONE: Record<string, string>  = { image: '#10b981', flow_image: '#00e5ff', video: '#ff6b35' };
+  const KIND_LABEL: Record<string, string> = { image: 'Image', flow_image: 'Flow Image', video: 'Flow Video' };
   // When set, the read-only saved-frames gallery is open for this pipeline.
   // Lets finished/cancelled pipelines (not in the live registry) be reviewed
   // without re-entering the live focused view.
@@ -4246,10 +4313,14 @@ function PipelinesOverview({ onFocus, onReopen, onCreate, onDelete, onBackfill, 
     });
   };
 
-  const total = rows.length;
-  const live = rows.filter(r => !r.cancelled && r.stage !== 'done').length;
-  const done = rows.filter(r => !r.cancelled && r.stage === 'done').length;
-  const cancelled = rows.filter(r => r.cancelled).length;
+  // The New Flow Image / New Flow Video buttons are create actions (not
+  // filters), so the list shows every pipeline. Per-card kind badges below
+  // let the user tell them apart at a glance.
+  const visibleRows = rows;
+  const total = visibleRows.length;
+  const live = visibleRows.filter(r => !r.cancelled && r.stage !== 'done').length;
+  const done = visibleRows.filter(r => !r.cancelled && r.stage === 'done').length;
+  const cancelled = visibleRows.filter(r => r.cancelled).length;
 
   return (
     <div className="h-full flex flex-col p-5 gap-4 overflow-hidden">
@@ -4270,43 +4341,53 @@ function PipelinesOverview({ onFocus, onReopen, onCreate, onDelete, onBackfill, 
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') {
                     const n = newName.trim();
-                    if (n) { onCreate(n); setCreating(false); setNewName(''); }
+                    if (n) { onCreate(n, newKind); setCreating(false); setNewName(''); }
                   }
                   if (e.key === 'Escape') { setCreating(false); setNewName(''); }
                 }}
-                placeholder="Pipeline name…"
+                placeholder={`${KIND_LABEL[newKind]} pipeline name…`}
                 style={{
-                  background: '#0a0f1c', border: '1px solid #10b981',
+                  background: '#0a0f1c',
+                  border: `1px solid ${KIND_TONE[newKind]}`,
                   borderRadius: 6, padding: '6px 10px',
-                  color: '#e6ebf5', fontSize: 12, outline: 'none', minWidth: 200,
+                  color: '#e6ebf5', fontSize: 12, outline: 'none', minWidth: 220,
                 }} />
               <button onClick={() => {
                 const n = newName.trim();
-                if (n) { onCreate(n); setCreating(false); setNewName(''); }
+                if (n) { onCreate(n, newKind); setCreating(false); setNewName(''); }
               }}
                 disabled={!newName.trim()}
                 className="px-3 py-1.5 rounded-md text-[11px] font-semibold transition-colors"
                 style={{
-                  background: newName.trim() ? '#10b981' : '#1a2333',
+                  background: newName.trim() ? KIND_TONE[newKind] : '#1a2333',
                   color: newName.trim() ? '#05130a' : '#53607a',
                   cursor: newName.trim() ? 'pointer' : 'not-allowed',
                   border: 'none',
-                }}>Create</button>
+                }}>Create {KIND_LABEL[newKind]}</button>
               <button onClick={() => { setCreating(false); setNewName(''); }}
                 className="text-[11px] text-text-dim hover:text-text px-2 py-1.5">
                 Cancel
               </button>
             </div>
           ) : (
-            <button onClick={() => setCreating(true)}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[11px] font-semibold transition-colors"
-              style={{
-                background: 'rgba(16,185,129,0.12)',
-                color: '#10b981',
-                border: '1px solid rgba(16,185,129,0.4)',
-              }}>
-              + New Pipeline
-            </button>
+            <div className="flex items-center gap-2">
+              {/* Direct create actions — click to start that kind of pipeline
+                  (opens the name box). Image = previous content pipeline. */}
+              {[
+                { k: 'image',      label: 'New Image',       Icon: Image },
+                { k: 'flow_image', label: 'New Flow Image',  Icon: Image },
+                { k: 'video',      label: 'New Flow Video',  Icon: Workflow },
+              ].map(({ k, label, Icon }) => {
+                const tone = KIND_TONE[k];
+                return (
+                  <button key={k} onClick={() => { setNewKind(k as any); setCreating(true); }}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[11px] font-semibold transition-colors"
+                    style={{ background: withAlpha(tone, 0.12), color: tone, border: `1px solid ${withAlpha(tone, 0.4)}` }}>
+                    <Icon size={12} /> {label}
+                  </button>
+                );
+              })}
+            </div>
           )}
           <button onClick={fetchAll} disabled={loading}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[11px] text-text-dim hover:text-text border border-border-soft hover:border-border transition-colors">
@@ -4322,16 +4403,16 @@ function PipelinesOverview({ onFocus, onReopen, onCreate, onDelete, onBackfill, 
         </div>
       )}
 
-      {!loading && !err && rows.length === 0 && (
+      {!loading && !err && visibleRows.length === 0 && (
         <div className="flex-1 flex flex-col items-center justify-center text-text-dim text-[13px] gap-2">
           <Inbox size={32} strokeWidth={1.5} />
-          <div>No pipelines yet. Start one from the Pipeline tab.</div>
+          <div>No pipelines yet. Use <span style={{ color: '#00e5ff' }}>New Flow Image</span> or <span style={{ color: '#ff6b35' }}>New Flow Video</span> to start one.</div>
         </div>
       )}
 
       <div className="grid gap-3 overflow-y-auto pr-1"
            style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))' }}>
-        {rows.map((p) => {
+        {visibleRows.map((p) => {
           const tone = stageColor(p.stage, p.paused, p.cancelled);
           const isLive = liveIds.has(p.id);
           return (
@@ -4379,7 +4460,20 @@ function PipelinesOverview({ onFocus, onReopen, onCreate, onDelete, onBackfill, 
                 }}>
               <div className="flex items-start justify-between gap-2 mb-2 pr-9">
                 <div className="min-w-0">
-                  <div className="text-[13px] font-semibold text-text truncate">{p.name}</div>
+                  <div className="flex items-center gap-1.5">
+                    <div className="text-[13px] font-semibold text-text truncate">{p.name}</div>
+                    {(() => {
+                      const k = p.kind || 'image';
+                      const kt = k === 'video' ? '#ff6b35' : k === 'flow_image' ? '#00e5ff' : '#10b981';
+                      const kl = k === 'video' ? 'FLOW VIDEO' : k === 'flow_image' ? 'FLOW IMAGE' : 'IMAGE';
+                      return (
+                        <span className="px-1.5 py-0.5 rounded text-[8px] font-semibold tracking-wider shrink-0"
+                              style={{ background: withAlpha(kt, 0.12), color: kt, border: `1px solid ${withAlpha(kt, 0.35)}` }}>
+                          {kl}
+                        </span>
+                      );
+                    })()}
+                  </div>
                   <div className="text-[10px] text-text-dim font-mono truncate mt-0.5">{p.id}</div>
                 </div>
                 <span className="px-2 py-0.5 rounded-full text-[10px] font-mono uppercase tracking-wider shrink-0"
@@ -6995,9 +7089,14 @@ export default function App() {
         {/* VERTICAL NAV RAIL (scrolls if buttons exceed height) */}
         <nav className="w-[64px] shrink-0 flex flex-col items-center py-2 gap-0.5 relative z-20 overflow-y-auto"
           style={{
-            background: 'rgba(10,15,28,0.55)',
-            backdropFilter: 'blur(20px) saturate(140%)',
-            WebkitBackdropFilter: 'blur(20px) saturate(140%)',
+            // SOLID background — deliberately NOT backdrop-filter. Electron's
+            // bundled Chromium fails to composite a backdrop-filter element's
+            // children (the nav icons) over the ReactFlow canvas in the
+            // Pipeline view, so the whole rail vanished there (worked in a
+            // newer standalone Chrome, which is why it looked fine over CDP).
+            // An opaque background paints reliably over any content, incl. the
+            // node-graph canvas.
+            background: '#0b1020',
             borderRight: '1px solid rgba(255,255,255,0.06)',
             scrollbarWidth: 'none',
           }}>
@@ -7158,8 +7257,8 @@ export default function App() {
                 directAction('reopen_pipeline', { id });
                 setActiveTab('pipeline');
               }}
-              onCreate={(name) => {
-                directAction('start_pipeline', { name });
+              onCreate={(name, kind) => {
+                directAction('start_pipeline', { name, kind });
                 // After creating, switch to the Pipeline tab so the user
                 // can immediately drop the source MD file onto the new
                 // pipeline's ask_location stage.

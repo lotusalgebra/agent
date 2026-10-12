@@ -28,12 +28,28 @@ from pathlib import Path
 from typing import Optional
 
 _PROFILE_DIR = Path(os.path.expanduser("~/.lotus_auth/chrome_profile"))
-GEMINI_URL = "https://gemini.google.com/app"
+def _authuser() -> int:
+    """Google account index for this profile (see lotus_config.google_authuser).
+    Read at import; change the config and restart to switch accounts."""
+    try:
+        import lotus_config
+        return lotus_config.google_authuser()
+    except Exception:
+        return 0
+
+
+# Account-pinned Gemini URL. The bare /app path resolves to whichever account
+# signed in first, which may not be the one holding the paid plan.
+GEMINI_URL = f"https://gemini.google.com/u/{_authuser()}/app"
 
 # JS expression → true iff a REAL, visible "Stop generating" button is
 # present. We deliberately avoid `aria-label*="Stop"` because that fuzzy
 # match also hits "More options for <prompt>" buttons on previous chat
 # bubbles whenever an old prompt contained the word "stop".
+# Seconds a Stop button may stay "stuck" before we treat the chat as wedged
+# and bail to a fresh chat (instead of re-clicking Stop for the full deadline).
+_WEDGED_CHAT_SEC = 40.0
+
 _JS_STOP_BTN_PRESENT = """
     (() => Array.from(document.querySelectorAll(
         'button[aria-label], button[data-testid]'
@@ -398,6 +414,149 @@ async def _wait_for_image_element(page, timeout_s: float = 240.0, verbose: bool 
     return None
 
 
+import lotus_imgutil
+
+
+def _accept_fullres(save_path, label: str, verbose: bool) -> bool:
+    """A file has just been written to save_path. Accept it only if it's a
+    real full-resolution asset; otherwise delete it and return False so the
+    download cascade falls through to the next strategy. Centralises the
+    preview-vs-fullres guard that every download tier shares. Resolution is
+    judged by `lotus_imgutil` (format-agnostic — handles PNG and JPEG), so a
+    downscaled preview is rejected no matter which format Gemini served."""
+    try:
+        edge = lotus_imgutil.long_edge(save_path)
+    except Exception:
+        edge = 0
+    if edge >= lotus_imgutil.MIN_FULLRES_LONG_EDGE:
+        if verbose:
+            size = save_path.stat().st_size
+            print(f"[bot] {label} → {save_path} "
+                  f"({edge}px long edge, {size // 1024} KB)")
+        return True
+    # Low-res preview (or unreadable) — discard so we don't ship a thumbnail.
+    try:
+        save_path.unlink()
+    except Exception:
+        pass
+    if verbose:
+        print(f"[bot] {label} returned low-res preview "
+              f"({edge}px long edge) — rejecting, will try next strategy")
+    return False
+
+
+_STAGING_DIR = Path(os.path.expanduser("~/.lotus_auth/download_staging"))
+
+
+async def _materialize_download(dl, save_path: Path, since_ts: float,
+                                verbose: bool = True) -> bool:
+    """Move a completed Playwright download to `save_path`, recovering when
+    Playwright's own artifact is missing.
+
+    Attaching to a REAL Chrome over CDP means Playwright often can't take
+    ownership of downloads: `Browser.setDownloadBehavior` fails and preflight
+    deliberately swallows that error (`.catch(() => {})`) because raising
+    would break CDP attach entirely. Chrome then saves the file **itself**,
+    into the `download.default_directory` that `lotus_preflight.
+    _ensure_download_prefs` pins at ~/.lotus_auth/download_staging. The
+    download event still fires, so `expect_download` returns — but
+    `dl.path()` names an artifact under /var/folders/.../playwright-artifacts-*
+    that was never created, and moving it raised FileNotFoundError. Every
+    later strategy then failed too (blob: src already revoked, canvas tainted
+    or 1024px), so the frame was marked FAILED while the real full-res file
+    sat in staging. That is the bug this repairs.
+
+    Order: dl.path() → dl.save_as() → newest matching file in staging.
+    """
+    # 1. The normal path — works whenever Playwright did own the download.
+    try:
+        tmp = await dl.path()
+        if tmp and os.path.exists(tmp):
+            shutil.move(str(tmp), str(save_path))
+            return True
+    except Exception:
+        pass
+
+    # 2. save_as() re-reads from Playwright's side; sometimes succeeds where
+    #    path() doesn't hand us a usable file.
+    try:
+        await dl.save_as(str(save_path))
+        if save_path.exists() and save_path.stat().st_size > 4096:
+            return True
+    except Exception:
+        pass
+
+    # 3. Chrome kept it. Pick the newest file that appeared in staging since
+    #    just before the click — matching on mtime rather than name because
+    #    Chrome appends " (1)", " (2)" on collisions.
+    try:
+        if _STAGING_DIR.is_dir():
+            fresh = [p for p in _STAGING_DIR.iterdir()
+                     if p.is_file() and not p.name.startswith(".")
+                     and not p.name.endswith(".crdownload")
+                     and p.stat().st_mtime >= since_ts - 2
+                     and p.stat().st_size > 4096]
+            if fresh:
+                newest = max(fresh, key=lambda p: p.stat().st_mtime)
+                shutil.move(str(newest), str(save_path))
+                if verbose:
+                    print(f"[bot] recovered native download from staging "
+                          f"({newest.name})")
+                return True
+    except Exception as e:
+        if verbose:
+            print(f"[bot] staging recovery failed: {e}")
+    return False
+
+
+# Gemini's DownloadGeneratedImage RPC (batchexecute rpcid "c8o8Fe") takes an
+# optional 5th field: the download resolution. Since 2026-09-22 the web UI
+# no longer sends it — the old <download-generated-image-button> is flag-gated
+# off and the surviving "Download image" button omits the field — so the server
+# returns a 1K preview (928x1152 / 1024x1024) that _accept_fullres rightly
+# rejects. The server still honours the field; verified live 2026-09-23:
+#   (absent) -> 1K preview   1 -> 2K (1856x2304, what the old full-size button
+#   gave)   2 -> 4K (3712x4608, ~8 MB)   3 -> not a size; don't use.
+# So we rewrite the page's own request in flight and let the normal click →
+# staging → full-res gate path carry on unchanged.
+_DOWNLOAD_RES = int(os.environ.get("LOTUS_GEMINI_DOWNLOAD_RES", "1"))
+
+
+async def _ensure_fullres_download_route(page, verbose: bool = True) -> None:
+    """Install (once per page) a route that adds the resolution field to
+    Gemini's c8o8Fe download RPC. Harmless if the page already sends one."""
+    if getattr(page, "_lotus_fullres_route", False):
+        return
+    import json
+    from urllib.parse import parse_qs, urlencode
+
+    async def _rewrite(route):
+        req = route.request
+        try:
+            post = parse_qs(req.post_data or "", keep_blank_values=True)
+            freq = json.loads(post["f.req"][0])
+            call = freq[0][0]
+            inner = json.loads(call[1])
+            if call[0] == "c8o8Fe" and len(inner) == 4:
+                inner.append(_DOWNLOAD_RES)
+                call[1] = json.dumps(inner)
+                post["f.req"] = [json.dumps(freq)]
+                if verbose:
+                    print(f"[bot] full-res route: requesting download "
+                          f"resolution={_DOWNLOAD_RES} from Gemini")
+                await route.continue_(post_data=urlencode(post, doseq=True))
+                return
+        except Exception as e:
+            if verbose:
+                print(f"[bot] full-res route: could not rewrite c8o8Fe ({e}) — "
+                      f"sending unmodified")
+        await route.continue_()
+
+    await page.route(lambda url: "batchexecute" in url and "rpcids=c8o8Fe" in url,
+                     _rewrite)
+    page._lotus_fullres_route = True
+
+
 async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> Optional[str]:
     """Save the rendered image to disk.
 
@@ -413,6 +572,12 @@ async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> 
     """
     save_path = Path(save_to)
     save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        await _ensure_fullres_download_route(page, verbose)
+    except Exception as e:
+        if verbose:
+            print(f"[bot] full-res route install failed: {e}")
 
     # PRIMARY — SCOPED hover & click. Walk up from THIS img to its
     # message-bubble container, then click the Download button that
@@ -452,12 +617,69 @@ async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> 
             except Exception: pass
         await page.wait_for_timeout(900)
 
+        # PRIMARY (validated live 2026-06-27): click the explicit full-res
+        # download button via a real Playwright locator SCOPED to THIS image's
+        # <generated-image> host. A clean .click() auto-waits for visibility +
+        # actionability and reliably fires the CDP download event. The legacy
+        # JS-mark path below instead marks the button via getBoundingClientRect
+        # then does a force=True click — force bypasses actionability, so a
+        # transient hover/tooltip overlay swallowed the click and the download
+        # leaked to a NATIVE Save-As with no download event (the regression
+        # this repairs). Keep the legacy walk-up as a fallback for older/other
+        # Gemini UIs that don't use <generated-image>.
+        try:
+            scoped_dl = (img_loc
+                .locator("xpath=ancestor-or-self::generated-image[1]")
+                .locator('download-generated-image-button button, '
+                         'button[aria-label="Download full-sized image"]')
+                .first)
+            if await scoped_dl.count():
+                try:
+                    await scoped_dl.scroll_into_view_if_needed(timeout=4000)
+                except Exception:
+                    pass
+                _t0 = time.time()
+                async with page.expect_download(timeout=60_000) as dl_info:
+                    await scoped_dl.click(timeout=15_000)
+                dl = await dl_info.value
+                if await _materialize_download(dl, save_path, _t0, verbose):
+                    if _accept_fullres(save_path, "downloaded via scoped button", verbose):
+                        return str(save_path)
+        except Exception as e:
+            if verbose:
+                print(f"[bot] scoped-locator download failed: {e} — trying legacy path")
+
         # Resolve the Download button that is inside the same bubble as
         # this exact img element. We use a JS path that walks up the DOM
         # from the hovered <img> looking for a descendant with a
         # Download-ish aria-label — on each ancestor level.
         clicked = await img_loc.evaluate("""
             (img) => {
+                const mark = (b) => {
+                    const r = b.getBoundingClientRect();
+                    if (r.width < 1 || r.height < 1) return false;
+                    b.setAttribute('data-lotus-picked', '1');
+                    return true;
+                };
+                // PRIMARY (Gemini UI as of 2026-06): the full-res download is an
+                // explicit <download-generated-image-button> inside this image's
+                // <generated-image> host. aria-label is "Download full-sized
+                // image". This replaced the old hover "Download" button; the
+                // legacy fuzzy walk-up below no longer reliably matches it, and
+                // when it misses, the click leaks to a NATIVE Chrome download
+                // (Gemini_Generated_Image_*.png) + a Save-As prompt. Target the
+                // element explicitly and let expect_download capture it.
+                let gi = img;
+                while (gi && gi.tagName !== 'GENERATED-IMAGE') gi = gi.parentElement;
+                if (gi) {
+                    const explicit = gi.querySelector(
+                        'download-generated-image-button button, ' +
+                        'button[aria-label="Download full-sized image"]'
+                    );
+                    if (explicit && mark(explicit)) return true;
+                }
+                // FALLBACK (legacy/other UI): walk up from the <img> looking for
+                // a Download-ish aria-label on each ancestor level.
                 const isDl = (el) => {
                     const a = (el.getAttribute('aria-label')||'').toLowerCase();
                     const d = (el.getAttribute('data-test-id')||'').toLowerCase();
@@ -475,11 +697,7 @@ async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> 
                     );
                     for (const b of btns) {
                         if (!isDl(b)) continue;
-                        const r = b.getBoundingClientRect();
-                        if (r.width < 1 || r.height < 1) continue;
-                        // Mark it so the Python side can see we matched.
-                        b.setAttribute('data-lotus-picked', '1');
-                        return true;
+                        if (mark(b)) return true;
                     }
                 }
                 return false;
@@ -500,6 +718,7 @@ async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> 
                                           bb["y"] + bb["height"]/2)
                     await page.wait_for_timeout(300)
             except Exception: pass
+            _t0 = time.time()
             async with page.expect_download(timeout=60_000) as dl_info:
                 await dl_button.click(timeout=15_000, force=True)
             # Clear the marker so subsequent slides don't race on it.
@@ -510,18 +729,9 @@ async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> 
                 )
             except Exception: pass
             dl = await dl_info.value
-            tmp = await dl.path()
-            shutil.move(str(tmp), str(save_path))
-            size = save_path.stat().st_size
-            if size > 2048:
-                if verbose:
-                    print(f"[bot] downloaded via scoped button → {save_path} "
-                          f"({size//1024} KB)")
-                return str(save_path)
-            try: save_path.unlink()
-            except Exception: pass
-            if verbose:
-                print(f"[bot] scoped download returned tiny file ({size}b) — falling back")
+            if await _materialize_download(dl, save_path, _t0, verbose):
+                if _accept_fullres(save_path, "downloaded via scoped button", verbose):
+                    return str(save_path)
         else:
             if verbose:
                 print("[bot] no Download button found within this image's bubble — falling back")
@@ -552,26 +762,20 @@ async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> 
             resp = await ctx.request.get(full_src, timeout=45_000)
             if resp.ok:
                 body = await resp.body()
-                if body and len(body) > 2048:
+                if body:
                     save_path.write_bytes(body)
-                    if verbose:
-                        print(f"[bot] request-context fetched → {save_path} "
-                              f"({len(body)//1024} KB)")
-                    return str(save_path)
-                if verbose:
-                    print(f"[bot] request-context got tiny body ({len(body or b'')}b)"
-                          f" — retrying with raw src")
-                # Try again without the size suffix (some URLs reject =s0).
+                    if _accept_fullres(save_path, "request-context fetched", verbose):
+                        return str(save_path)
+                # =s0 gave a preview/empty body — retry without the size suffix
+                # (some URLs reject =s0).
                 if full_src != src:
                     resp = await ctx.request.get(src, timeout=30_000)
                     if resp.ok:
                         body = await resp.body()
-                        if body and len(body) > 2048:
+                        if body:
                             save_path.write_bytes(body)
-                            if verbose:
-                                print(f"[bot] request-context (raw) → {save_path} "
-                                      f"({len(body)//1024} KB)")
-                            return str(save_path)
+                            if _accept_fullres(save_path, "request-context (raw)", verbose):
+                                return str(save_path)
             else:
                 if verbose:
                     print(f"[bot] request-context status {resp.status}")
@@ -588,10 +792,8 @@ async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> 
                 try:
                     _, b64 = src.split(",", 1)
                     save_path.write_bytes(base64.b64decode(b64))
-                    if verbose:
-                        print(f"[bot] saved data-URL → {save_path} "
-                              f"({save_path.stat().st_size//1024} KB)")
-                    return str(save_path)
+                    if _accept_fullres(save_path, "saved data-URL", verbose):
+                        return str(save_path)
                 except Exception as e:
                     if verbose: print(f"[bot] data: parse failed: {e}")
             if src.startswith("blob:") or src.startswith("http"):
@@ -609,16 +811,8 @@ async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> 
                     import base64
                     if b64:
                         save_path.write_bytes(base64.b64decode(b64))
-                        size = save_path.stat().st_size
-                        if size > 2048:
-                            if verbose:
-                                print(f"[bot] fetched src → {save_path} "
-                                      f"({size//1024} KB)")
+                        if _accept_fullres(save_path, "fetched src", verbose):
                             return str(save_path)
-                        try: save_path.unlink()
-                        except Exception: pass
-                        if verbose:
-                            print(f"[bot] src fetch returned tiny file ({size}b)")
                 except Exception as e:
                     if verbose: print(f"[bot] src-fetch path failed: {e}")
     except Exception as e:
@@ -646,15 +840,13 @@ async def _download_image(page, img_loc, save_to: str, verbose: bool = True) -> 
             import base64
             _, b64 = data_url.split(",", 1)
             save_path.write_bytes(base64.b64decode(b64))
-            size = save_path.stat().st_size
-            if size > 2048:
-                if verbose:
-                    print(f"[bot] canvas-capture → {save_path} ({size//1024} KB)")
+            # Canvas capture reads the *displayed* bitmap (img.naturalWidth),
+            # which is the downscaled preview unless Gemini rendered full-res
+            # inline — so this almost always fails the full-res gate. That's
+            # intended: a ~1024px capture is exactly the low-res junk we refuse
+            # to ship (it was the source of the 1024x765 "saved" frames).
+            if _accept_fullres(save_path, "canvas-capture", verbose):
                 return str(save_path)
-            try: save_path.unlink()
-            except Exception: pass
-            if verbose:
-                print(f"[bot] canvas-capture returned tiny file ({size}b)")
         elif isinstance(data_url, str) and data_url.startswith("ERR:"):
             if verbose: print(f"[bot] canvas-capture rejected: {data_url[4:]}")
     except Exception as e:
@@ -1143,93 +1335,116 @@ async def _enable_thinking_mode(page, verbose: bool = False,
 
 
 async def _select_create_image_tool(page, verbose: bool = False) -> bool:
-    """Enable Gemini's "Create image" tool for the current conversation.
+    """ALWAYS enable Gemini's "Create image" tool for the current conversation.
 
-    UI shape (verified 2026-05-19):
-      • the `+` button next to the prompt input has aria-label="Upload and tools"
-      • clicking it opens a menu whose tool toggles are
-        `<button role="menuitemcheckbox">` with empty aria-label —
-        match by textContent only ("Create image", "Create video", …)
-      • the item carries aria-checked="true|false"; clicking flips it,
-        so we must skip the click if it's already enabled
-    Returns True on success (enabled or already on), False otherwise. Never raises.
+    Gemini moved image generation into the "Upload and tools" (`+`) menu —
+    without selecting it, Gemini replies with a TEXT description instead of an
+    image. This runs a retry loop that, on EACH attempt:
+      1. dismisses any modal / popup window that opened over the composer
+         (feature announcements, banners, or a leftover-open menu),
+      2. opens the "Upload and tools" menu (aria-label prefix "upload and tools"),
+      3. clicks the "Create image" item (role menuitem/checkbox/option, matched
+         by text; skips the click if it's already checked),
+      4. re-opens the menu to VERIFY "Create image" ended up checked.
+
+    Returns True only once the tool is confirmed selected (or already on).
+    Never raises.
     """
-    try:
-        await _dismiss_modals(page, verbose=False)
-    except Exception:
-        pass
-
-    try:
-        opened = await page.evaluate("""
-            () => {
-                const b = Array.from(document.querySelectorAll('button, [role="button"]'))
-                    .find(e => {
-                        const a = (e.getAttribute('aria-label') || '').toLowerCase().trim();
-                        // Prefix match — Gemini may append state to the label
-                        // (as it did to the mode picker), so avoid exact equality.
-                        if (!a.startsWith('upload and tools')) return false;
-                        const r = e.getBoundingClientRect();
-                        return r.width > 0 && r.height > 0;
-                    });
-                if (!b) return {opened: false};
-                b.click();
-                return {opened: true};
-            }
-        """)
-    except Exception as e:
-        if verbose: print(f"[bot] create-image picker err: {e}")
-        opened = {"opened": False}
-
-    if not opened or not opened.get("opened"):
-        if verbose: print("[bot] create-image: 'Upload and tools' button not found")
-        return False
-    if verbose:
-        print("[bot] create-image: opened 'Upload and tools' menu")
-
-    await page.wait_for_timeout(500)
-
-    try:
-        pick = await page.evaluate("""
-            () => {
-                const items = Array.from(document.querySelectorAll(
-                    '[role="menuitemcheckbox"], [role="menuitem"]'
-                ));
-                const visible = items.filter(e => {
+    _OPEN_JS = """
+        () => {
+            const b = Array.from(document.querySelectorAll('button, [role="button"]'))
+                .find(e => {
+                    const a = (e.getAttribute('aria-label') || '').toLowerCase().trim();
+                    if (!a.startsWith('upload and tools')) return false;
                     const r = e.getBoundingClientRect();
                     return r.width > 0 && r.height > 0;
                 });
-                const target = visible.find(e =>
-                    (e.textContent || '').trim().toLowerCase() === 'create image'
-                );
-                if (!target) {
-                    return {
-                        picked: false,
-                        seen: visible.slice(0, 20).map(e =>
-                            (e.textContent || '').trim().slice(0, 40)
-                        ).filter(Boolean),
-                    };
-                }
-                const checked = (target.getAttribute('aria-checked') || '').toLowerCase() === 'true';
-                if (!checked) target.click();
-                return {picked: true, alreadyOn: checked};
+            if (!b) return {opened: false};
+            b.click();
+            return {opened: true};
+        }
+    """
+    # Match "Create image" across the menu-item roles Gemini uses; tolerate a
+    # trailing "New" badge and extra whitespace. Returns checked-state too.
+    _PICK_JS = """
+        (doClick) => {
+            const items = Array.from(document.querySelectorAll(
+                '[role="menuitemcheckbox"], [role="menuitem"], [role="option"], gem-menu-item, button'
+            )).filter(e => { const r = e.getBoundingClientRect();
+                             return r.width > 0 && r.height > 0; });
+            const norm = e => (e.textContent || '').replace(/\\s+/g, ' ')
+                                 .replace(/\\bnew\\b/i, '').trim().toLowerCase();
+            const target = items.find(e => norm(e) === 'create image' ||
+                                           norm(e).startsWith('create image'));
+            if (!target) {
+                return {found: false, seen: [...new Set(items.map(e =>
+                    (e.textContent||'').replace(/\\s+/g,' ').trim().slice(0,32))
+                    .filter(Boolean))].slice(0, 20)};
             }
-        """)
-    except Exception as e:
-        if verbose: print(f"[bot] create-image menu click err: {e}")
-        pick = {"picked": False}
+            const checked = (target.getAttribute('aria-checked') || '')
+                              .toLowerCase() === 'true';
+            if (doClick && !checked) target.click();
+            return {found: true, checked};
+        }
+    """
 
-    try: await page.keyboard.press("Escape")
-    except Exception: pass
-    await page.wait_for_timeout(300)
+    for attempt in range(1, 4):
+        try:
+            await _dismiss_modals(page, verbose=False)
+        except Exception:
+            pass
 
-    if pick and pick.get("picked"):
+        try:
+            opened = await page.evaluate(_OPEN_JS)
+        except Exception as e:
+            if verbose: print(f"[bot] create-image open err (try {attempt}): {e}")
+            opened = {"opened": False}
+        if not opened or not opened.get("opened"):
+            if verbose:
+                print(f"[bot] create-image: 'Upload and tools' not found (try {attempt})")
+            await page.wait_for_timeout(600)
+            continue
+        await page.wait_for_timeout(500)
+
+        try:
+            pick = await page.evaluate(_PICK_JS, True)
+        except Exception as e:
+            if verbose: print(f"[bot] create-image pick err (try {attempt}): {e}")
+            pick = {"found": False}
+        try: await page.keyboard.press("Escape")
+        except Exception: pass
+        await page.wait_for_timeout(400)
+
+        if not pick or not pick.get("found"):
+            if verbose:
+                print(f"[bot] create-image: item not in menu (try {attempt}). "
+                      f"Seen: {pick.get('seen') if pick else 'n/a'}")
+            continue
+        if pick.get("checked"):
+            if verbose: print(f"[bot] create-image: already enabled (try {attempt})")
+            return True
+
+        # We just clicked it — VERIFY it's now checked by reopening the menu.
+        try:
+            await _dismiss_modals(page, verbose=False)
+            reopen = await page.evaluate(_OPEN_JS)
+            if reopen and reopen.get("opened"):
+                await page.wait_for_timeout(400)
+                verify = await page.evaluate(_PICK_JS, False)
+                try: await page.keyboard.press("Escape")
+                except Exception: pass
+                await page.wait_for_timeout(300)
+                if verify and verify.get("found") and verify.get("checked"):
+                    if verbose: print(f"[bot] create-image: enabled + verified (try {attempt})")
+                    return True
+        except Exception:
+            pass
         if verbose:
-            state = "already enabled" if pick.get("alreadyOn") else "enabled"
-            print(f"[bot] create-image: {state}")
-        return True
+            print(f"[bot] create-image: clicked but not verified (try {attempt}) — retrying")
+        await page.wait_for_timeout(600)
+
     if verbose:
-        print("[bot] create-image: 'Create image' item not in menu. "
-              f"Seen: {pick.get('seen') if pick else 'n/a'}")
+        print("[bot] create-image: FAILED to enable after 3 attempts")
     return False
 
 
@@ -1445,6 +1660,7 @@ async def _wait_gemini_idle(page, max_wait_s: float = 420.0,
     # One Stop click isn't always enough — keep clicking until it sticks.
     last_stop_click = 0.0
     stuck_since: Optional[float] = None
+    abandons = 0   # how many times we've bailed to a fresh chat this call
     while time.time() < deadline:
         try:
             # Returns {busy: bool, why: str} — the `why` tells us which
@@ -1505,7 +1721,29 @@ async def _wait_gemini_idle(page, max_wait_s: float = 420.0,
                     stuck_since = time.time()
                 stuck_for = time.time() - stuck_since
                 since_click = time.time() - last_stop_click
-                if stuck_for >= 5.0 and since_click >= 15.0:
+                # WEDGED-CHAT ESCAPE: if the Stop button stays stuck past this
+                # threshold despite re-clicks, the chat is wedged (Gemini
+                # crashed mid-stream / React ignores the click). Re-clicking
+                # for the full 7-min deadline just hangs the pipeline — every
+                # send then fails with "input never became ready". Abandon the
+                # chat and open a FRESH one, which is idle by definition. Try
+                # this at most twice before falling through to the timeout.
+                if stuck_for >= _WEDGED_CHAT_SEC and abandons < 2:
+                    abandons += 1
+                    if verbose:
+                        print(f"[idle] Stop button wedged {int(stuck_for)}s — "
+                              f"abandoning chat, opening a fresh one "
+                              f"(attempt {abandons})")
+                    try:
+                        if await _start_new_chat(page, verbose=verbose):
+                            await page.wait_for_timeout(1200)
+                            stuck_since = None
+                            return True   # fresh chat is idle + ready
+                    except Exception as _e:
+                        if verbose:
+                            print(f"[idle] new-chat escape failed: {_e}")
+                    stuck_since = time.time()   # reset window, try once more
+                elif stuck_for >= 5.0 and since_click >= 15.0:
                     if verbose:
                         print(f"[idle] Stop button stuck for {int(stuck_for)}s — re-clicking")
                     await _click_stop_response(page, verbose=False)
@@ -1784,7 +2022,7 @@ async def _do_post_sequential_mode_singlechat(
         expected += 1
         if verbose: print(f"[seq] phase1 slide {i+1}/{n} — waiting for image count ≥ {expected}…")
         grew = False
-        MAX_REGEN = 2
+        MAX_REGEN = 3
         regens = 0
         per_attempt_timeout = max(200.0, wait_timeout / (MAX_REGEN + 1))
         while regens <= MAX_REGEN and not grew:
@@ -1823,13 +2061,30 @@ async def _do_post_sequential_mode_singlechat(
             if grew: break
             if stalled_at_idle and regens < MAX_REGEN:
                 regens += 1
+                # Text-only recovery alternates two strategies. Clicking
+                # Regenerate alone re-runs the IDENTICAL prompt Gemini just
+                # chose to answer in text (Thinking mode often writes a report
+                # instead of generating), so it frequently comes back text
+                # again. On odd attempts we instead send an explicit NUDGE that
+                # directly instructs an image — far more likely to flip it out
+                # of text mode. Even attempts fall back to the Regenerate button
+                # (helps when the nudge itself got a text reply).
+                use_nudge = (regens % 2 == 1)
                 if verbose:
                     print(f"[seq] phase1 slide {i+1} — text-only response, "
-                          f"clicking Regenerate (attempt {regens}/{MAX_REGEN})")
+                          f"{'nudging for image' if use_nudge else 'clicking Regenerate'} "
+                          f"(attempt {regens}/{MAX_REGEN})")
                 try:
-                    await _click_regenerate(page, verbose=verbose)
+                    if use_nudge:
+                        await _send_same_chat_strict(
+                            page,
+                            "Generate the image described in my previous message "
+                            "now, as a single image. Do not reply with text.",
+                            verbose=verbose, max_wait_s=60.0)
+                    else:
+                        await _click_regenerate(page, verbose=verbose)
                 except Exception: pass
-                # Wait briefly for the regenerate to start streaming again.
+                # Wait briefly for the regenerate/nudge to start streaming again.
                 await asyncio.sleep(4.0)
             else:
                 break
@@ -2064,7 +2319,24 @@ async def _do_create_image(prompt: str, save_to: str,
             await page.wait_for_timeout(1500)
         except Exception:
             pass
-        if not await _send_prompt(page, prompt, verbose=verbose):
+        # Enable Gemini's "Create image" tool BEFORE sending. Gemini moved
+        # image generation into the "Upload and tools" menu (2026-08) — without
+        # selecting it, Gemini replies with a TEXT description and
+        # _wait_for_image_element times out → the frame fails. The burst path
+        # (create_post_burst) already does this; the single-frame path
+        # (_do_create_image, used by create_image_and_download and the pipeline
+        # reroute) was missing it. Must be re-selected after each navigation
+        # since goto resets the composer's tool state.
+        await _select_create_image_tool(page, verbose=verbose)
+        # On the retry, append an explicit image instruction. A first-attempt
+        # timeout is most often a text-only reply (Thinking mode writes a
+        # report instead of generating), so re-running the identical prompt
+        # tends to fail the same way. Spelling out "single generated image,
+        # not text" nudges Gemini out of text mode.
+        send_prompt = prompt if attempt == 1 else (
+            prompt + "\n\nReturn the result as a single generated image, "
+            "not a text description.")
+        if not await _send_prompt(page, send_prompt, verbose=verbose):
             if attempt == 2: return None
             continue
         img = await _wait_for_image_element(
