@@ -1990,7 +1990,24 @@ class LotusPhase1:
             self._broadcast(type="agent_response", text=f"Pipeline error: {e}")
 
     def _verify_ollama(self):
-        """Check Ollama is running and model is available."""
+        """Check Ollama is running and model is available. Fatal only when
+        Gemma is the brain - with a Claude API key it is just the fallback."""
+        import lotus_llm
+        try:
+            claude_live = lotus_llm.backend() == "claude"
+        except lotus_llm.LLMError:
+            claude_live = False
+        if claude_live:
+            try:
+                r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3)
+                models = [m["name"] for m in r.json().get("models", [])]
+                note = (f"{MODEL} ready as fallback"
+                        if any(MODEL in m for m in models)
+                        else f"'{MODEL}' not pulled - no offline fallback")
+            except requests.RequestException:
+                note = "Ollama not running - no offline fallback"
+            print(f"✅ Brain: Claude API ({note})")
+            return
         try:
             r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3)
             models = [m["name"] for m in r.json().get("models", [])]
@@ -2038,55 +2055,19 @@ class LotusPhase1:
         if len(self.history) > 20:
             self.history = self.history[-20:]
 
-        for _ in range(5):
-            try:
-                r = requests.post(
-                    f"{OLLAMA_URL}/api/chat",
-                    json={
-                        "model": MODEL,
-                        "messages": [{"role": "system", "content": SYSTEM_PROMPT}, *self.history],
-                        "tools": TOOL_SCHEMAS,
-                        "stream": False,
-                        "options": {"temperature": 0.3, "num_predict": 400},
-                    },
-                    timeout=60,
-                )
-                msg = r.json().get("message", {}) or {}
-            except Exception as e:
-                return f"Brain error: {e}"
-
-            tool_calls = msg.get("tool_calls") or []
-            if tool_calls:
-                # Append Gemma's tool-call message to history
-                self.history.append({
-                    "role": "assistant",
-                    "content": msg.get("content", "") or "",
-                    "tool_calls": tool_calls,
-                })
-                # Execute each tool and append results
-                for tc in tool_calls:
-                    fn = tc.get("function", {}) or {}
-                    name = fn.get("name", "")
-                    args = fn.get("arguments", {}) or {}
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except Exception:
-                            args = {}
-                    tool_result = self._dispatch_tool(name, args)
-                    self.history.append({
-                        "role": "tool",
-                        "content": tool_result,
-                        "name": name,
-                    })
-                continue  # loop back to Gemma for a final reply
-
-            # No tool calls — this is the final text reply
-            text = (msg.get("content") or "").strip()
-            self.history.append({"role": "assistant", "content": text})
-            return text
-
-        return "I processed the request but couldn't summarize it in time."
+        # lotus_llm runs the tool loop (max 5 rounds) on Claude, or on local
+        # Gemma with the original options when no API key is set. History
+        # stays in Ollama's message shape either way.
+        import lotus_llm
+        try:
+            text, new_entries = lotus_llm.run_tools(
+                self.history, TOOL_SCHEMAS, self._dispatch_tool,
+                system=SYSTEM_PROMPT, task="chat", max_rounds=5, timeout=60,
+            )
+        except lotus_llm.LLMError as e:
+            return f"Brain error: {e}"
+        self.history.extend(new_entries)
+        return text
 
     def _dispatch_tool(self, name: str, args: dict) -> str:
         """Execute a Gemma-requested tool, return a string result for Gemma
@@ -2672,20 +2653,18 @@ class LotusPhase1:
     def _gemma_oneshot(self, prompt: str, max_tokens: int = 600) -> str:
         """Single-turn Gemma call for structured analysis — no tool calls,
         no history coupling, small enough to stay responsive."""
+        # Via lotus_llm: Claude when a key is set, else Gemma with the old
+        # budget. Claude gets the task's full budget so its thinking pass
+        # can't eat the answer.
+        import lotus_llm
         try:
-            r = requests.post(
-                f"{OLLAMA_URL}/api/chat",
-                json={
-                    "model": MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "stream": False,
-                    "options": {"temperature": 0.35, "num_predict": max_tokens},
-                },
-                timeout=90,
+            return lotus_llm.chat(
+                [{"role": "user", "content": prompt}], task="review",
+                ollama_max_tokens=max_tokens,
+                ollama_options={"temperature": 0.35}, timeout=90,
             )
-            return (r.json().get("message", {}) or {}).get("content", "").strip()
         except Exception as e:
-            return f"(Gemma failed: {e})"
+            return f"(model call failed: {e})"
 
     def _tool_analyze_news(self, title: str, url: str = "", question: str = "") -> str:
         """Local-Gemma deep analysis pipeline. Google News redirect URLs are
@@ -3627,23 +3606,17 @@ class LotusPhase1:
     def _gemma_score(self, query: str, response: str) -> float:
         """Cheap one-shot rating call. Temperature is low and num_predict small."""
         import re as _re
+        import lotus_llm
         try:
-            r = requests.post(
-                f"{OLLAMA_URL}/api/chat",
-                json={
-                    "model": MODEL,
-                    "messages": [{"role": "user", "content": (
-                        "Rate the answer below from 1 to 10 based on how well it "
-                        "addresses the question (accuracy, specificity, usefulness). "
-                        "Respond with ONLY the number, nothing else.\n\n"
-                        f"Question: {query}\n\nAnswer: {response[:1500]}\n\nScore (1-10):"
-                    )}],
-                    "stream": False,
-                    "options": {"temperature": 0.1, "num_predict": 8},
-                },
-                timeout=15,
+            txt = lotus_llm.chat(
+                [{"role": "user", "content": (
+                    "Rate the answer below from 1 to 10 based on how well it "
+                    "addresses the question (accuracy, specificity, usefulness). "
+                    "Respond with ONLY the number, nothing else.\n\n"
+                    f"Question: {query}\n\nAnswer: {response[:1500]}\n\nScore (1-10):"
+                )}],
+                task="classify", ollama_max_tokens=8, timeout=15,
             )
-            txt = (r.json().get("message", {}) or {}).get("content", "").strip()
             m = _re.search(r"(\d+(?:\.\d+)?)", txt)
             val = float(m.group(1)) if m else 7.0
             return max(1.0, min(10.0, val))
@@ -4173,21 +4146,18 @@ class LotusPhase1:
 
     def _extract_prompts_single_call(self, md_text: str) -> list:
         """One Gemma call for a manageably-sized chunk."""
-        print(f"[gemma-extract] asking Gemma to parse {len(md_text)} chars…", flush=True)
+        print(f"[gemma-extract] asking the model to parse {len(md_text)} chars…", flush=True)
+        import lotus_llm
         try:
-            # Stream the JSON reply so connection stays alive on slow runs
-            with requests.post(
-                f"{OLLAMA_URL}/api/chat",
-                json={
-                    "model": MODEL,
-                    "format": "json",
-                    "stream": True,
-                    # Bigger output budget — a 63 KB doc with 4 long prompts
-                    # verbatim is ~4K chars; larger real files may need 16K+
-                    "options": {"temperature": 0.1, "num_predict": 32000,
-                                "num_ctx": 65536},
-                    "messages": [
-                        {"role": "system", "content": (
+            # lotus_llm streams both backends, so a slow run keeps the
+            # connection alive. Bigger output budget — a 63 KB doc with 4 long
+            # prompts verbatim is ~4K chars; larger real files may need 16K+.
+            content = lotus_llm.chat(
+                [{"role": "user", "content": md_text}],
+                task="extract", json_mode=True, max_tokens=32000,
+                ollama_options={"temperature": 0.1, "num_ctx": 65536},
+                timeout=600,
+                system=(
                             "You are a COMPLETE-EXTRACTION parser. The user will "
                             "paste a markdown document. Your job is to extract "
                             "EVERY image-generation prompt in it — do not stop "
@@ -4204,28 +4174,8 @@ class LotusPhase1:
                             "THOROUGH: if the document mentions N slides or N "
                             "prompts, your output array must contain N strings.\n\n"
                             'Respond strictly as JSON: {"prompts": ["...", "...", ...]}'
-                        )},
-                        {"role": "user", "content": md_text},
-                    ],
-                },
-                stream=True,
-                timeout=(10, 600),       # 10s connect, 10min read
-            ) as r:
-                r.raise_for_status()
-                content_parts = []
-                for line in r.iter_lines(decode_unicode=True):
-                    if not line:
-                        continue
-                    try:
-                        chunk = json.loads(line)
-                    except Exception:
-                        continue
-                    piece = (chunk.get("message") or {}).get("content", "")
-                    if piece:
-                        content_parts.append(piece)
-                    if chunk.get("done"):
-                        break
-                content = "".join(content_parts)
+                ),
+            )
             print(f"[gemma-extract] raw reply ({len(content)} chars): {content[:300]!r}", flush=True)
             data = None
             try:
@@ -5917,16 +5867,9 @@ class LotusPhase1:
             "Respond with a single sentence (max 25 words), no preamble:"
         )
         try:
-            r = requests.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={
-                    "model": MODEL, "prompt": prompt, "stream": False,
-                    "options": {"temperature": 0.2},
-                },
-                timeout=30,
-            )
-            r.raise_for_status()
-            txt = (r.json().get("response") or "").strip()
+            import lotus_llm
+            txt = lotus_llm.chat([{"role": "user", "content": prompt}],
+                                 task="review", timeout=30)
             if txt.lower().startswith("none") or len(txt) < 12:
                 return ""
             # Trim — dashboard strip has limited real estate.
@@ -6821,7 +6764,14 @@ class LotusPhase1:
         """
         print("\n" + "=" * 60)
         print("  LOTUS AGENT — Phase 1 (Voice + Gemma + Voiceprint Auth)")
-        print(f"  Model: {MODEL} (local via Ollama)")
+        try:
+            import lotus_llm
+            _brain = ("Claude API - " + lotus_llm.config()["tasks"]["chat"]["model"]
+                      if lotus_llm.backend() == "claude"
+                      else f"{MODEL} (local via Ollama)")
+        except Exception:
+            _brain = f"{MODEL} (local via Ollama)"
+        print(f"  Model: {_brain}")
         print(f"  Wake word: '{WAKE_WORD}'  (aliases accepted for mistranscription)")
         if self.auth and self.auth.is_enrolled:
             print(f"  Auth: voiceprint required — authorized: {', '.join(self.auth.enrolled_users)}")

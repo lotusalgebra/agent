@@ -290,26 +290,42 @@ def _with_images(messages: list, images: Optional[list], claude: bool) -> list:
 
 
 def _ollama_chat(messages, system, json_mode, max_tokens, timeout,
-                 url=None, model=None) -> str:
+                 url=None, model=None, options=None) -> str:
     msgs = ([{"role": "system", "content": system}] if system else []) + list(messages)
     url = url or _ollama_url()
     body = {
         "model": model or _ollama_model(),
-        "stream": False,
+        # Streamed so `timeout` bounds the gap between chunks, not the whole
+        # generation - long extractions would otherwise time out mid-reply.
+        "stream": True,
         "messages": msgs,
         # JSON calls are classifiers: keep them deterministic.
         "options": {"temperature": 0.0 if json_mode else 0.1,
                     "num_predict": int(max_tokens or 4096),
-                    "num_ctx": 16384},
+                    "num_ctx": 16384, **(options or {})},
     }
     if json_mode:
         body["format"] = "json"
+    parts = []
     try:
-        r = requests.post(f"{url}/api/chat", json=body, timeout=timeout)
-        r.raise_for_status()
+        with requests.post(f"{url}/api/chat", json=body, stream=True,
+                           timeout=timeout) as r:
+            r.raise_for_status()
+            for line in r.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                piece = (chunk.get("message") or {}).get("content", "")
+                if piece:
+                    parts.append(piece)
+                if chunk.get("done"):
+                    break
     except requests.RequestException as e:
         raise LLMError(f"Ollama unreachable at {url}: {e}") from e
-    return ((r.json().get("message") or {}).get("content") or "").strip()
+    return "".join(parts).strip()
 
 
 def _ollama_stream(messages, system, max_tokens, timeout) -> Iterator[str]:
@@ -348,6 +364,7 @@ def chat(messages: list, *, system: Optional[str] = None, task: str = "chat",
          ollama_max_tokens: Optional[int] = None,
          images: Optional[list] = None,
          ollama_url: Optional[str] = None, ollama_model: Optional[str] = None,
+         ollama_options: Optional[dict] = None,
          timeout: float = 600) -> str:
     """One request -> the reply text. With json_mode the text is a bare JSON
     object/array string ready for json.loads(). Raises LLMRefusal / LLMError.
@@ -356,7 +373,8 @@ def chat(messages: list, *, system: Optional[str] = None, task: str = "chat",
     callers whose old Gemma budget is far below what Claude needs to think.
     `images` are base64 PNGs attached to the last user message.
     `ollama_url` / `ollama_model` override the Gemma fallback per call
-    (agent-mesh children point at the mother's Ollama this way)."""
+    (agent-mesh children point at the mother's Ollama this way);
+    `ollama_options` is merged into the Ollama request's `options`."""
     _local.backend = None
     import anthropic
     cfg = config()
@@ -389,7 +407,7 @@ def chat(messages: list, *, system: Optional[str] = None, task: str = "chat",
     text = _ollama_chat(_with_images(messages, images, False), system, json_mode,
                         ollama_max_tokens or max_tokens
                         or _task(cfg, task).get("max_tokens"), timeout,
-                        url=ollama_url, model=ollama_model)
+                        url=ollama_url, model=ollama_model, options=ollama_options)
     _local.backend = "ollama"
     return _extract_json(text) if json_mode else text
 
@@ -428,6 +446,169 @@ def stream_chat(messages: list, *, system: Optional[str] = None,
                   f"falling back to Ollama", flush=True)
     yield from _ollama_stream(messages, system,
                               max_tokens or _task(cfg, task).get("max_tokens"), timeout)
+
+
+# ── tool-calling loop ─────────────────────────────────────────────────────
+#
+# Callers keep history in Ollama's shape - {"role": "user"|"assistant"|"tool",
+# "content", "tool_calls"?, "name"?} - so a conversation can move between
+# backends. For Claude it is converted per request: tool calls become
+# tool_use blocks with positional ids, tool results the matching
+# tool_result blocks. Claude's own reply blocks (thinking included) are
+# replayed unchanged only within the current turn; what is stored back into
+# history is text + tool calls, so callers can trim history freely.
+
+def _tools_to_claude(tools: list) -> list:
+    out = []
+    for t in tools:
+        fn = t.get("function", t)
+        out.append({"name": fn["name"], "description": fn.get("description", ""),
+                    "input_schema": fn.get("parameters")
+                    or {"type": "object", "properties": {}}})
+    return out
+
+
+def _history_to_claude(history: list) -> list:
+    out, pending = [], []
+
+    def close_pending():
+        # A tool call with no recorded result (history was cut) still needs one.
+        if pending:
+            out.append({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": tid, "content": "(no result)"}
+                for tid in pending]})
+            pending.clear()
+
+    for i, m in enumerate(history):
+        role, content = m.get("role"), m.get("content") or ""
+        if role == "tool":
+            if not pending:
+                continue                      # orphan - its call was trimmed away
+            block = {"type": "tool_result", "tool_use_id": pending.pop(0),
+                     "content": str(content) or "(empty)"}
+            last = out[-1] if out else None
+            if (last and last["role"] == "user" and isinstance(last["content"], list)
+                    and last["content"] and last["content"][0].get("type") == "tool_result"):
+                last["content"].append(block)
+            else:
+                out.append({"role": "user", "content": [block]})
+            continue
+        close_pending()
+        if role == "assistant":
+            if not out:
+                continue                      # Claude must open on a user turn
+            blocks = [{"type": "text", "text": content}] if content.strip() else []
+            ids = []
+            for k, tc in enumerate(m.get("tool_calls") or []):
+                fn = tc.get("function", {}) or {}
+                args = fn.get("arguments") or {}
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {}
+                ids.append(f"toolu_h{i}_{k}")
+                blocks.append({"type": "tool_use", "id": ids[-1],
+                               "name": fn.get("name", ""), "input": args})
+            if blocks:
+                out.append({"role": "assistant", "content": blocks})
+                pending.extend(ids)
+        elif role == "user" and str(content).strip():
+            out.append({"role": "user", "content": content})
+    close_pending()
+    return out
+
+
+def run_tools(history: list, tools: list, dispatch, *, system: str,
+              task: str = "chat", max_rounds: int = 5, timeout: float = 60,
+              ollama_options: Optional[dict] = None,
+              give_up: str = "I processed the request but couldn't summarize it in time."
+              ) -> tuple:
+    """Run one user turn of a tool-calling conversation.
+
+    `history` ends with the new user message (Ollama shape, see above);
+    `tools` are Ollama/OpenAI-style function schemas; `dispatch(name, args)`
+    executes one tool and returns a string. Returns (final_text, new_entries)
+    where new_entries are the Ollama-shaped messages to append to history.
+    Raises LLMError when no backend answers."""
+    import anthropic
+    cfg = config()
+    new: list = []
+    if backend(cfg) == "claude":
+        model, use_beta, kwargs = _claude_kwargs(
+            cfg, task, _history_to_claude(history), system, False, None)
+        kwargs["tools"] = _tools_to_claude(tools)
+        client = _anthropic().with_options(timeout=timeout)
+        api = client.beta.messages if use_beta else client.messages
+        live: list = []
+        try:
+            for _ in range(max_rounds):
+                resp = api.create(**{**kwargs, "messages": kwargs["messages"] + live})
+                _record_usage(resp.model or model, task, resp.usage)
+                if resp.stop_reason == "refusal":
+                    raise LLMRefusal("Claude declined the request")
+                text = "".join(b.text for b in resp.content if b.type == "text").strip()
+                calls = [b for b in resp.content if b.type == "tool_use"]
+                if not calls or resp.stop_reason == "max_tokens":
+                    new.append({"role": "assistant", "content": text})
+                    _local.backend = "claude"
+                    return text, new
+                live.append({"role": "assistant", "content": resp.content})
+                new.append({"role": "assistant", "content": text, "tool_calls": [
+                    {"function": {"name": b.name, "arguments": b.input}} for b in calls]})
+                results = []
+                for b in calls:
+                    out = str(dispatch(b.name, dict(b.input or {})))
+                    results.append({"type": "tool_result", "tool_use_id": b.id,
+                                    "content": out or "(empty)"})
+                    new.append({"role": "tool", "content": out, "name": b.name})
+                live.append({"role": "user", "content": results})
+            _local.backend = "claude"
+            return give_up, new
+        except LLMRefusal:
+            raise
+        except (anthropic.AuthenticationError, anthropic.PermissionDeniedError,
+                anthropic.APIConnectionError, anthropic.RateLimitError,
+                anthropic.InternalServerError) as e:
+            # Tools may already have run - never replay them on another backend.
+            if live or cfg["provider"] == "claude" or not cfg["ollama_fallback"]:
+                raise LLMError(f"Claude call failed: {e}") from e
+            print(f"[llm] Claude unavailable ({type(e).__name__}) - "
+                  f"falling back to Ollama", flush=True)
+
+    # Ollama: the loop LOTUS ran before lotus_llm, unchanged.
+    opts = {"temperature": 0.3, "num_predict": 400, **(ollama_options or {})}
+    for _ in range(max_rounds):
+        try:
+            r = requests.post(f"{_ollama_url()}/api/chat", json={
+                "model": _ollama_model(),
+                "messages": [{"role": "system", "content": system}, *history, *new],
+                "tools": tools, "stream": False, "options": opts,
+            }, timeout=timeout)
+            msg = r.json().get("message", {}) or {}
+        except Exception as e:
+            raise LLMError(str(e)) from e
+        tool_calls = msg.get("tool_calls") or []
+        if tool_calls:
+            new.append({"role": "assistant", "content": msg.get("content", "") or "",
+                        "tool_calls": tool_calls})
+            for tc in tool_calls:
+                fn = tc.get("function", {}) or {}
+                args = fn.get("arguments", {}) or {}
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = {}
+                new.append({"role": "tool", "content": dispatch(fn.get("name", ""), args),
+                            "name": fn.get("name", "")})
+            continue
+        text = (msg.get("content") or "").strip()
+        new.append({"role": "assistant", "content": text})
+        _local.backend = "ollama"
+        return text, new
+    _local.backend = "ollama"
+    return give_up, new
 
 
 def status() -> dict:
