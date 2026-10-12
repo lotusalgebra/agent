@@ -318,7 +318,7 @@ class ReviewAgent(BaseAgent):
 
     def _ask_gemma(self, prompt_text: str, ocr_text: str,
                    img_b64: Optional[str]) -> dict:
-        import requests
+        # Name kept for callers; routes via lotus_llm (Claude or Gemma).
         vision_mode = img_b64 is not None
         review_prompt = (
             "You are LOTUS Review Agent. Decide whether a generated image "
@@ -349,29 +349,26 @@ class ReviewAgent(BaseAgent):
             '{"match": true|false, "text_match": true|false, '
             '"vision_match": true|false, "reason": "<15-word reason>"}'
         )
-        payload: dict = {
-            "model":   self.model,
-            "prompt":  review_prompt,
-            "stream":  False,
-            "options": {"temperature": 0.1},
-        }
-        if vision_mode:
-            payload["images"] = [img_b64]
+        import contextlib
+        import lotus_llm
         try:
-            # Serialise all Gemma-review calls. Without this, many watchers
+            # Serialise Gemma-review calls only. Without this, many watchers
             # fire concurrently, all get queued on the single GPU, and each
-            # request individually exceeds its 180s timeout.
-            with ReviewAgent._gemma_sem:
-                r = requests.post(
-                    f"{self.ollama_url}/api/generate",
-                    json=payload,
+            # request individually exceeds its timeout. Claude has no such
+            # bottleneck, so reviews run in parallel when it answers.
+            gate = (ReviewAgent._gemma_sem if lotus_llm.backend() == "ollama"
+                    else contextlib.nullcontext())
+            with gate:
+                response = lotus_llm.chat(
+                    [{"role": "user", "content": review_prompt}],
+                    task="review", json_mode=True,
+                    images=[img_b64] if vision_mode else None,
+                    ollama_url=self.ollama_url, ollama_model=self.model,
                     # Vision calls are heavier — bump the ceiling.
                     timeout=240 if vision_mode else 60,
                 )
-                r.raise_for_status()
-                response = r.json().get("response", "").strip()
         except Exception as e:
-            raise RuntimeError(f"Gemma review call failed: {e}")
+            raise RuntimeError(f"review call failed: {e}")
 
         # Extract the first JSON object from the response — Gemma sometimes
         # wraps the reply in extra prose despite being told not to.
@@ -488,7 +485,8 @@ class ArchiverAgent(BaseAgent):
     # ── private ──
 
     def _ask_gemma_for_summary(self, pipeline: dict, counts: dict) -> str:
-        import requests
+        # Name kept for callers; routes via lotus_llm (Claude or Gemma).
+        import lotus_llm
         name    = pipeline.get("name") or pipeline.get("id") or "pipeline"
         src     = os.path.basename(pipeline.get("source_md") or "")
         stage   = pipeline.get("stage", "")
@@ -528,22 +526,17 @@ class ArchiverAgent(BaseAgent):
             "Write the summary now, no preamble:"
         )
         try:
-            r = requests.post(
-                f"{self.ollama_url}/api/generate",
-                json={
-                    "model": self.model, "prompt": prompt, "stream": False,
-                    "options": {"temperature": 0.2},
-                },
+            text = lotus_llm.chat(
+                [{"role": "user", "content": prompt}], task="review",
+                ollama_url=self.ollama_url, ollama_model=self.model,
                 timeout=45,
             )
-            r.raise_for_status()
-            text = (r.json().get("response") or "").strip()
             # Trim accidental "Summary:" prefix + collapse whitespace.
             text = re.sub(r"^\s*Summary[:\-\s]*", "", text, flags=re.IGNORECASE)
             text = re.sub(r"\s+", " ", text).strip()
             return text[:1200]
         except Exception as e:
-            return f"(summary unavailable — Gemma call failed: {e})"
+            return f"(summary unavailable — model call failed: {e})"
 
 
 class RemoteAgent(BaseAgent):

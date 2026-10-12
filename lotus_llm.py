@@ -272,10 +272,29 @@ def _extract_json(text: str) -> str:
 
 # ── Ollama (fallback) ─────────────────────────────────────────────────────
 
-def _ollama_chat(messages, system, json_mode, max_tokens, timeout) -> str:
+def _with_images(messages: list, images: Optional[list], claude: bool) -> list:
+    """Attach base64 PNGs to the last user message - as image blocks for
+    Claude, as Ollama's `images` field for Gemma. Copies, never mutates."""
+    if not images:
+        return list(messages)
+    msgs = [dict(m) for m in messages]
+    last = msgs[-1]
+    if claude:
+        text = last["content"]
+        blocks = text if isinstance(text, list) else [{"type": "text", "text": text}]
+        last["content"] = [{"type": "image", "source": {"type": "base64",
+                            "media_type": "image/png", "data": b}} for b in images] + blocks
+    else:
+        last["images"] = list(images)
+    return msgs
+
+
+def _ollama_chat(messages, system, json_mode, max_tokens, timeout,
+                 url=None, model=None) -> str:
     msgs = ([{"role": "system", "content": system}] if system else []) + list(messages)
+    url = url or _ollama_url()
     body = {
-        "model": _ollama_model(),
+        "model": model or _ollama_model(),
         "stream": False,
         "messages": msgs,
         # JSON calls are classifiers: keep them deterministic.
@@ -286,10 +305,10 @@ def _ollama_chat(messages, system, json_mode, max_tokens, timeout) -> str:
     if json_mode:
         body["format"] = "json"
     try:
-        r = requests.post(f"{_ollama_url()}/api/chat", json=body, timeout=timeout)
+        r = requests.post(f"{url}/api/chat", json=body, timeout=timeout)
         r.raise_for_status()
     except requests.RequestException as e:
-        raise LLMError(f"Ollama unreachable at {_ollama_url()}: {e}") from e
+        raise LLMError(f"Ollama unreachable at {url}: {e}") from e
     return ((r.json().get("message") or {}).get("content") or "").strip()
 
 
@@ -327,18 +346,24 @@ def last_backend() -> Optional[str]:
 def chat(messages: list, *, system: Optional[str] = None, task: str = "chat",
          json_mode: bool = False, max_tokens: Optional[int] = None,
          ollama_max_tokens: Optional[int] = None,
+         images: Optional[list] = None,
+         ollama_url: Optional[str] = None, ollama_model: Optional[str] = None,
          timeout: float = 600) -> str:
     """One request -> the reply text. With json_mode the text is a bare JSON
     object/array string ready for json.loads(). Raises LLMRefusal / LLMError.
 
     `ollama_max_tokens` caps only the Gemma fallback - for latency-bound
-    callers whose old Gemma budget is far below what Claude needs to think."""
+    callers whose old Gemma budget is far below what Claude needs to think.
+    `images` are base64 PNGs attached to the last user message.
+    `ollama_url` / `ollama_model` override the Gemma fallback per call
+    (agent-mesh children point at the mother's Ollama this way)."""
     _local.backend = None
     import anthropic
     cfg = config()
     if backend(cfg) == "claude":
-        model, use_beta, kwargs = _claude_kwargs(cfg, task, messages, system,
-                                                  json_mode, max_tokens)
+        model, use_beta, kwargs = _claude_kwargs(
+            cfg, task, _with_images(messages, images, True), system,
+            json_mode, max_tokens)
         client = _anthropic().with_options(timeout=timeout)
         api = client.beta.messages if use_beta else client.messages
         try:
@@ -361,9 +386,10 @@ def chat(messages: list, *, system: Optional[str] = None, task: str = "chat",
                 raise LLMError(f"Claude call failed: {e}") from e
             print(f"[llm] Claude unavailable ({type(e).__name__}) - "
                   f"falling back to Ollama", flush=True)
-    text = _ollama_chat(messages, system, json_mode,
+    text = _ollama_chat(_with_images(messages, images, False), system, json_mode,
                         ollama_max_tokens or max_tokens
-                        or _task(cfg, task).get("max_tokens"), timeout)
+                        or _task(cfg, task).get("max_tokens"), timeout,
+                        url=ollama_url, model=ollama_model)
     _local.backend = "ollama"
     return _extract_json(text) if json_mode else text
 
