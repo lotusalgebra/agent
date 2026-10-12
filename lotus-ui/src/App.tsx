@@ -4,7 +4,7 @@ import {
   Activity, Archive, Brain, Check, CheckCircle2, ChevronLeft, ChevronRight,
   CircleCheck, Clock, Download, FileText, FolderOpen, Grid3X3, Home, Image,
   ImageOff, Inbox, LayoutGrid, Library, ListChecks, Maximize2, Mic,
-  RefreshCw, Search, Settings, Sparkles, StopCircle, Trash2, Workflow,
+  MessageSquareReply, RefreshCw, Search, Send, Settings, Sparkles, StopCircle, Trash2, Workflow,
   X, Zap,
 } from 'lucide-react';
 
@@ -3752,6 +3752,219 @@ function HeroView({ voiceState }: {
   );
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+   Social — Instagram / YouTube comment-reply review queue + audits.
+   Backed by lotus_social.py via /api/social/* (bearer token). LOTUS only
+   drafts; a reply is posted when, and only when, Approve is clicked here.
+   ══════════════════════════════════════════════════════════════════════ */
+interface SocialDraft {
+  id: number; platform: 'instagram' | 'youtube'; media_id: string; media_title: string;
+  comment_id: string; author: string; comment_text: string; comment_ts: string;
+  draft: string | null; status: string; reply_id: string | null; error: string | null;
+}
+interface SocialStatus {
+  mcp: Record<string, { ready: boolean; missing: string[] }>;
+  llm: string;
+  jobs: Record<string, { kind: string; state: string; error?: string;
+    result?: { new_comments?: number; drafted?: number; skipped?: number; platform: string; path: string; report?: string } }>;
+}
+
+function SocialView() {
+  const token = (() => { try { return localStorage.getItem('lotus_token') || ''; } catch { return ''; } })();
+  const auth = { Authorization: `Bearer ${token}` };
+  const [status, setStatus] = useState<SocialStatus | null>(null);
+  const [drafts, setDrafts] = useState<SocialDraft[]>([]);
+  const [filter, setFilter] = useState('pending');
+  const [edits, setEdits] = useState<Record<number, string>>({});
+  const [busy, setBusy] = useState<Record<number, boolean>>({});
+  const [err, setErr] = useState('');
+  const [report, setReport] = useState<{ platform: string; path: string; report: string } | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const [s, d] = await Promise.all([
+        fetch('/api/social/status', { headers: auth }),
+        fetch(`/api/social/drafts?status=${filter}`, { headers: auth }),
+      ]);
+      if (s.status === 401) { setErr('Not authorized — open the dashboard with ?token=…'); return; }
+      const sj: SocialStatus = await s.json();
+      setStatus(sj);
+      setDrafts((await d.json()).drafts || []);
+      for (const [k, j] of Object.entries(sj.jobs || {}))
+        if (k.startsWith('audit:') && j.state === 'done' && j.result?.report)
+          setReport({ platform: j.result.platform, path: j.result.path, report: j.result.report });
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filter, token]);
+
+  useEffect(() => {
+    const first = setTimeout(load, 0);
+    const t = setInterval(load, 5000);
+    return () => { clearTimeout(first); clearInterval(t); };
+  }, [load]);
+
+  const start = async (kind: 'fetch' | 'audit', platform: string) => {
+    setErr('');
+    const r = await fetch(`/api/social/${kind}`, {
+      method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ platform }),
+    });
+    const j = await r.json();
+    if (!r.ok) setErr(j.missing ? `${j.error}: ${j.missing.join('; ')}` : (j.error || `HTTP ${r.status}`));
+    load();
+  };
+
+  const decide = async (d: SocialDraft, action: 'approve' | 'reject') => {
+    setBusy(b => ({ ...b, [d.id]: true })); setErr('');
+    try {
+      const body = action === 'approve' && edits[d.id] !== undefined ? { text: edits[d.id] } : {};
+      const r = await fetch(`/api/social/drafts/${d.id}/${action}`, {
+        method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const j = await r.json();
+      if (!r.ok) setErr(`#${d.id}: ${j.error || r.status}`);
+    } finally { setBusy(b => ({ ...b, [d.id]: false })); load(); }
+  };
+
+  const tone = (p: string) => p === 'instagram' ? '#e1306c' : '#ff0000';
+  const panel = { background: '#0f1629', border: '1px solid rgba(255,255,255,0.07)' };
+
+  return (
+    <div className="h-full overflow-y-auto px-6 py-6">
+      <div className="max-w-[1100px] mx-auto">
+        <div className="flex items-center gap-3 mb-1">
+          <MessageSquareReply size={20} color="#e1306c" />
+          <h2 className="text-xl font-semibold text-white">Social</h2>
+          {status && <span className="text-[11px] text-slate-500 ml-2">brain: {status.llm}</span>}
+        </div>
+        <p className="text-[13px] text-slate-400 mb-5">
+          LOTUS drafts replies to new comments. <b className="text-slate-200">Nothing is posted until you click Approve.</b> Edit a
+          draft before approving; drafts with a <code>[PLACEHOLDER]</code> need a fact only you know.
+        </p>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-5">
+          {(['instagram', 'youtube'] as const).map(p => {
+            const st = status?.mcp?.[p];
+            const job = (k: string) => status?.jobs?.[`${k}:${p}`];
+            const running = (k: string) => job(k)?.state === 'running';
+            return (
+              <div key={p} className="rounded-xl p-4" style={panel}>
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="w-2 h-2 rounded-full" style={{ background: st?.ready ? '#10b981' : '#64748b' }} />
+                  <span className="text-[14px] font-semibold text-white">{p === 'youtube' ? 'YouTube' : 'Instagram'}</span>
+                  <span className="text-[11px] text-slate-500">{st?.ready ? 'connected' : 'not set up'}</span>
+                </div>
+                {st && !st.ready && (
+                  <ul className="text-[11px] text-slate-500 mb-2 list-disc pl-4">
+                    {st.missing.map(m => <li key={m} className="break-all">{m}</li>)}
+                  </ul>
+                )}
+                <div className="flex gap-2 flex-wrap">
+                  <button disabled={!st?.ready || running('fetch')} onClick={() => start('fetch', p)}
+                    className="px-3 py-1.5 rounded-lg text-[12px] font-semibold disabled:opacity-40"
+                    style={{ background: tone(p), color: '#fff' }}>
+                    {running('fetch') ? 'Drafting…' : 'Draft replies'}
+                  </button>
+                  <button disabled={!st?.ready || running('audit')} onClick={() => start('audit', p)}
+                    className="px-3 py-1.5 rounded-lg text-[12px] font-semibold disabled:opacity-40"
+                    style={{ background: '#1e293b', color: '#cbd5e1' }}>
+                    {running('audit') ? 'Auditing…' : 'Run audit'}
+                  </button>
+                </div>
+                {(['fetch', 'audit'] as const).map(k => job(k)?.state === 'error' && (
+                  <div key={k} className="text-[11px] mt-2" style={{ color: '#fca5a5' }}>{k}: {job(k)?.error}</div>
+                ))}
+                {job('fetch')?.state === 'done' && job('fetch')?.result && (
+                  <div className="text-[11px] text-slate-500 mt-2">
+                    last run: {job('fetch')?.result?.new_comments ?? 0} new · {job('fetch')?.result?.drafted ?? 0} drafted · {job('fetch')?.result?.skipped ?? 0} skipped
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {err && <div className="rounded-lg px-3 py-2 mb-4 text-[12px]" style={{ background: '#7f1d1d55', color: '#fecaca' }}>{err}</div>}
+
+        <div className="flex items-center gap-2 mb-3">
+          {['pending', 'posted', 'skipped', 'rejected', 'failed', 'all'].map(f => (
+            <button key={f} onClick={() => setFilter(f)}
+              className="px-2.5 py-1 rounded-md text-[11.5px] capitalize"
+              style={{ background: filter === f ? '#e1306c22' : '#0b1020', color: filter === f ? '#f9a8d4' : '#94a3b8',
+                       border: `1px solid ${filter === f ? '#e1306c55' : 'rgba(255,255,255,0.08)'}` }}>
+              {f}
+            </button>
+          ))}
+          <button onClick={load} title="Refresh" className="ml-auto px-2 py-1 rounded-md" style={{ background: '#1e293b', color: '#cbd5e1' }}>
+            <RefreshCw size={13} />
+          </button>
+        </div>
+
+        {drafts.length === 0 && <div className="text-[13px] text-slate-500 py-8 text-center">No {filter === 'all' ? '' : filter} drafts.</div>}
+        <div className="space-y-3">
+          {drafts.map(d => {
+            const text = edits[d.id] ?? d.draft ?? '';
+            const actionable = ['pending', 'failed', 'skipped'].includes(d.status);
+            const hasPlaceholder = /\[[A-Z][A-Z0-9 _/-]{1,40}\]/.test(text);
+            return (
+              <div key={d.id} className="rounded-xl p-4" style={panel}>
+                <div className="flex items-center gap-2 text-[11px] text-slate-500 mb-1">
+                  <span className="font-semibold capitalize" style={{ color: tone(d.platform) }}>{d.platform}</span>
+                  <span className="truncate max-w-[420px]" title={d.media_title}>· {d.media_title || d.media_id}</span>
+                  <span className="ml-auto">#{d.id} · {d.status}</span>
+                </div>
+                <div className="text-[13px] text-slate-200 mb-2">
+                  <span className="text-slate-400">@{d.author}:</span> {d.comment_text}
+                </div>
+                {actionable ? (
+                  <textarea value={text} rows={2}
+                    onChange={e => setEdits(x => ({ ...x, [d.id]: e.target.value }))}
+                    placeholder="Write a reply…"
+                    className="w-full px-3 py-2 rounded-lg text-[13px] text-slate-100 outline-none resize-y"
+                    style={{ background: '#0b1020', border: `1px solid ${hasPlaceholder ? '#f59e0b88' : 'rgba(255,255,255,0.1)'}` }} />
+                ) : (
+                  d.draft && <div className="text-[13px] text-emerald-300/90 pl-3 border-l-2 border-emerald-500/40">{d.draft}</div>
+                )}
+                {d.error && <div className="text-[11px] mt-1" style={{ color: d.status === 'failed' ? '#fca5a5' : '#fbbf24' }}>{d.error}</div>}
+                {actionable && (
+                  <div className="flex gap-2 mt-2">
+                    <button disabled={busy[d.id] || !text.trim() || hasPlaceholder} onClick={() => decide(d, 'approve')}
+                      title={hasPlaceholder ? 'Fill the [PLACEHOLDER] first' : 'Post this reply'}
+                      className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-[12px] font-semibold disabled:opacity-40"
+                      style={{ background: '#10b981', color: '#04120c' }}>
+                      <Send size={13} /> {busy[d.id] ? 'Posting…' : 'Approve & post'}
+                    </button>
+                    {d.status !== 'skipped' && (
+                      <button disabled={busy[d.id]} onClick={() => decide(d, 'reject')}
+                        className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-[12px] disabled:opacity-40"
+                        style={{ background: '#1e293b', color: '#cbd5e1' }}>
+                        <X size={13} /> Reject
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {report && (
+          <div className="rounded-xl p-4 mt-6" style={panel}>
+            <div className="flex items-center gap-2 mb-2">
+              <FileText size={15} color="#a78bfa" />
+              <span className="text-[14px] font-semibold text-white capitalize">{report.platform} audit</span>
+              <span className="text-[11px] text-slate-500 ml-2 truncate">{report.path}</span>
+              <button onClick={() => setReport(null)} className="ml-auto text-slate-500"><X size={14} /></button>
+            </div>
+            <pre className="text-[12.5px] text-slate-300 whitespace-pre-wrap font-sans">{report.report}</pre>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function GalleryTab() {
   const [runs, setRuns] = useState<HistRun[]>([]);
   const [stats, setStats] = useState<{runs: number; frames: number; approved: number} | null>(null);
@@ -6649,7 +6862,7 @@ export default function App() {
   const [input, setInput] = useState('');
   const [config, setConfig] = useState<LotusConfig | null>(null);
   const [configErr, setConfigErr] = useState<string>('');
-  const [activeTab, setActiveTab] = useState<'main' | 'actions' | 'pipeline' | 'pipelines' | 'queue' | 'gallery' | 'recordings'>('main');
+  const [activeTab, setActiveTab] = useState<'main' | 'actions' | 'pipeline' | 'pipelines' | 'queue' | 'gallery' | 'recordings' | 'social'>('main');
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [recorder, setRecorder] = useState<{active: boolean; elapsed_s: number; file: string | null}>(
     { active: false, elapsed_s: 0, file: null });
@@ -7107,8 +7320,9 @@ export default function App() {
             { key: 'pipelines',  label: 'All Pipelines', Icon: Grid3X3, tone: '#10b981' },
             { key: 'queue',      label: 'Queue',      Icon: ListChecks, tone: '#a78bfa' },
             { key: 'gallery',    label: 'Gallery',    Icon: Library,  tone: '#a855f7' },
+            { key: 'social',     label: 'Social',     Icon: MessageSquareReply, tone: '#e1306c' },
             { key: 'recordings', label: 'Recordings', Icon: Mic,      tone: '#ef4444' },
-          ] as { key: 'main'|'actions'|'pipeline'|'pipelines'|'queue'|'gallery'|'recordings'; label: string; Icon: any; tone: string }[]).map((t) => {
+          ] as { key: 'main'|'actions'|'pipeline'|'pipelines'|'queue'|'gallery'|'recordings'|'social'; label: string; Icon: any; tone: string }[]).map((t) => {
             const isActive = activeTab === t.key;
             return (
               <button key={t.key}
@@ -7274,6 +7488,8 @@ export default function App() {
             <QueueView />
           ) : activeTab === 'gallery' ? (
             <GalleryTab />
+          ) : activeTab === 'social' ? (
+            <SocialView />
           ) : activeTab === 'recordings' ? (
             <RecordingsTab recorder={recorder}
               onStart={() => directAction('rec_start')}

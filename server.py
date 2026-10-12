@@ -322,6 +322,10 @@ class DashboardServer:
                 self.end_headers()
 
             def do_POST(self):
+                # Instagram/YouTube comment drafts + audits (lotus_social).
+                import lotus_social as _social
+                if _social.handle_http(self, "POST"):
+                    return
                 # Reveal an already-saved frame in the OS file manager (Finder
                 # on macOS). The frame is rendered straight to the project
                 # folder, so the UI's old "download" affordance — which popped a
@@ -637,6 +641,9 @@ class DashboardServer:
                     self.send_response(302)
                     self.send_header("Location", "/lotus-ui/dist/index.html" + query)
                     self.end_headers()
+                    return
+                import lotus_social as _social
+                if _social.handle_http(self, "GET"):
                     return
                 if self.path.startswith("/api/config"):
                     try:
