@@ -739,7 +739,7 @@ interface UploadClassification {
   verdict: 'yes' | 'no' | 'uncertain';
   confidence: number;
   reason: string;
-  source: 'heuristic' | 'gemma' | 'fallback';
+  source: 'heuristic' | 'claude' | 'gemma' | 'fallback';
 }
 
 function SourceDropzone({ onPath, currentPath }: { onPath: (p: string) => void; currentPath?: string }) {

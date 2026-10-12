@@ -10,19 +10,19 @@ let the user proceed without ceremony when the answer is clear.
 Two-tier strategy:
   1. **Heuristic-first** — pattern-match the file head for known markers
      (## SLIDE / ## POST / ## TOPIC / fenced code blocks / "NB2 PROMPT"
-     labels). When these fire, return verdict immediately — no Gemma call,
+     labels). When these fire, return verdict immediately — no model call,
      so it's instant and reliable for the schemas this user actually ships.
-  2. **Gemma fallback** — only when the heuristic is silent. One-shot yes/no
-     classification with a short timeout. Falls back to 'uncertain' if
-     Ollama is unreachable, the model returns garbage, or anything else
-     goes wrong.
+  2. **Model fallback** — only when the heuristic is silent. One-shot yes/no
+     classification via lotus_llm (Claude, or local Gemma without a key)
+     with a short timeout. Falls back to 'uncertain' if no backend answers,
+     the model returns garbage, or anything else goes wrong.
 
 `classify_file(path)` returns:
   {
     'verdict':    'yes' | 'no' | 'uncertain',
     'confidence': float in [0.0, 1.0],
     'reason':     short human string,
-    'source':     'heuristic' | 'gemma' | 'fallback',
+    'source':     'heuristic' | 'claude' | 'gemma' | 'fallback',
   }
 """
 from __future__ import annotations
@@ -32,9 +32,6 @@ import os
 import re
 from typing import Optional
 
-import requests
-
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 DEFAULT_MODEL = "gemma4:e4b"
 MAX_HEAD_BYTES = 8192   # 8 KB head — large enough that medical-style files
                         # with a verbose metadata preamble still surface their
@@ -85,7 +82,7 @@ def _read_head(path: str, max_bytes: int = MAX_HEAD_BYTES) -> str:
 def _heuristic_verdict(head: str) -> Optional[dict]:
     """Pattern-match the file head. Returns a verdict dict on a clear hit,
     or None when no pattern fires (in which case the caller falls through
-    to Gemma)."""
+    to the model)."""
     # Strong NO wins over strong YES — if the head looks like code or HTML
     # we treat it as NO regardless of stray prompt-y words further down.
     for rx in _NO_MARKERS:
@@ -116,8 +113,8 @@ def _heuristic_verdict(head: str) -> Optional[dict]:
 
 
 def _gemma_verdict(head: str, model: str, timeout: int) -> dict:
-    """Tight one-shot Gemma call. JSON-only response. Bails to 'uncertain'
-    on any error — Ollama down, parse failure, slow response, etc."""
+    """Tight one-shot model call. JSON-only response. Bails to 'uncertain'
+    on any error — no backend, parse failure, slow response, etc."""
     system = (
         "Decide whether the text below is a list of image-generation prompts "
         "(scene descriptions a model like Midjourney / Gemini / NB2 could render).\n"
@@ -127,33 +124,28 @@ def _gemma_verdict(head: str, model: str, timeout: int) -> dict:
         '"reason": "<short>"}'
     )
     try:
-        r = requests.post(
-            f"{OLLAMA_URL}/api/chat",
-            json={
-                "model": model,
-                "stream": False,
-                "format": "json",
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user",   "content": head},
-                ],
-                "options": {"temperature": 0.0, "num_predict": 80},
-            },
+        # Claude (task 'classify') when a key is set, else local Gemma with
+        # its old 80-token budget so uploads stay inside `timeout`. `model`
+        # is kept for caller compatibility; Gemma comes from `ollama.model`.
+        import lotus_llm
+        content = lotus_llm.chat(
+            [{"role": "user", "content": head}], system=system,
+            task="classify", json_mode=True, ollama_max_tokens=80,
             timeout=timeout,
         )
-        r.raise_for_status()
-        content = (r.json().get("message") or {}).get("content", "").strip()
+        backend = "claude" if lotus_llm.last_backend() == "claude" else "gemma"
         parsed = json.loads(content)
         is_prompt = bool(parsed.get("is_prompt_file"))
         conf = float(parsed.get("confidence", 0.5))
         reason = str(parsed.get("reason", ""))[:140] or (
-            "Gemma classification" if is_prompt else "Gemma rejected as non-prompt"
+            f"{backend.title()} classification" if is_prompt
+            else f"{backend.title()} rejected as non-prompt"
         )
         return {
             "verdict":    "yes" if is_prompt else "no",
             "confidence": max(0.0, min(1.0, conf)),
             "reason":     reason,
-            "source":     "gemma",
+            "source":     backend,
         }
     except Exception as e:
         return {

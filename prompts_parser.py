@@ -22,13 +22,11 @@ and a proper library at the step where deterministic behaviour matters
 from __future__ import annotations
 
 import json
-import os
 import re
 from pathlib import Path
 from typing import Optional
 
 import mistune
-import requests
 
 try:
     import frontmatter  # python-frontmatter
@@ -412,13 +410,12 @@ def extract_candidates(md_text: str, include_motion: bool = False) -> list:
     return deduped
 
 
-# ── Gemma validation per-candidate ────────────────────────────────────────
+# ── LLM validation per-candidate (Claude via lotus_llm, Gemma fallback) ───
 
-# Child processes running on a different machine read Ollama from the
-# mother — the env var lets `lotus-child.py` retarget without code changes.
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+# Remote children still reach the mother's Ollama: lotus_llm reads the
+# OLLAMA_URL env var that `lotus-child.py` sets before importing agents.
 
-# Fast yes/no classifier — Gemma only returns a boolean, we keep the
+# Fast yes/no classifier — the model only returns a boolean, we keep the
 # parser's already-clean text. Cuts per-candidate time from ~30s to ~3s.
 CLASSIFY_SYSTEM_PROMPT = (
     "Classify: is the text below an image-generation prompt (describes a "
@@ -478,28 +475,19 @@ def validate_with_gemma(candidate: dict, model: str = "gemma4:e4b",
     if hits >= 3 and len(section_text.strip()) >= 80:
         return section_text.strip()
 
-    # 'section' candidates may include rule text or specs — ask Gemma.
-    # Bump num_predict so the model has room to produce the JSON AFTER its
-    # internal thinking pass (gemma4:e4b emits a `thinking` stream first
-    # and can finish with `done_reason: length` + empty content otherwise).
+    # 'section' candidates may include rule text or specs — ask the model.
+    # lotus_llm routes this to Claude (task 'classify') when an API key is
+    # set, else to local Gemma. `model` is kept for caller compatibility;
+    # the Gemma variant now comes from `ollama.model` in config. Leave room
+    # in max_tokens for the thinking pass, or the reply comes back empty.
     probe = candidate.get("text", "")[:1500]
     try:
-        r = requests.post(
-            f"{OLLAMA_URL}/api/chat",
-            json={
-                "model": model,
-                "format": "json",
-                "stream": False,
-                "options": {"temperature": 0.0, "num_predict": 400, "num_ctx": 8192},
-                "messages": [
-                    {"role": "system", "content": CLASSIFY_SYSTEM_PROMPT},
-                    {"role": "user", "content": probe},
-                ],
-            },
+        import lotus_llm
+        content = lotus_llm.chat(
+            [{"role": "user", "content": probe}],
+            system=CLASSIFY_SYSTEM_PROMPT, task="classify", json_mode=True,
             timeout=timeout,
         )
-        msg = r.json().get("message") or {}
-        content = (msg.get("content") or "").strip()
         if not content:
             # Small model hit the thinking cap. Fall back to a heuristic:
             # if the text has visual-prompt keywords, keep it.

@@ -1,6 +1,6 @@
 """Upwork management agent — scrapes the Best Matches feed via the
-user's CDP-attached real Chrome, scores jobs with local Gemma, can hand
-off to Claude.ai (browser) for proposal drafting.
+user's CDP-attached real Chrome, scores jobs and drafts proposals via
+lotus_llm (Claude API, or local Gemma when no key is set).
 
 Architecture mirrors gemini_bot/grok_video: connects via LOTUS_CDP_URL to
 a real signed-in Chrome (Upwork blocks Playwright Chromium aggressively;
@@ -28,7 +28,6 @@ import time
 from datetime import datetime
 from typing import Optional
 
-import requests
 from playwright.async_api import async_playwright
 
 import upwork_db as db
@@ -38,8 +37,6 @@ _FEED_URL = "https://www.upwork.com/nx/find-work/best-matches"
 _DEFAULT_TIMEOUT_MS = 30_000
 _VERBOSE = True
 
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-GEMMA_MODEL = "gemma4:e4b"
 
 
 # ── single dedicated event loop (mirrors grok_video pattern) ──────────────
@@ -214,7 +211,7 @@ def scrape_feed(*, limit: int = 20, verbose: bool = _VERBOSE) -> list:
     return fut.result(timeout=120)
 
 
-# ── scoring (Gemma) ──────────────────────────────────────────────────────
+# ── scoring ──────────────────────────────────────────────────────────────
 
 _SCORE_SYSTEM = (
     "You are a fit-scoring assistant for an Upwork freelancer. Given a "
@@ -231,7 +228,7 @@ _SCORE_SYSTEM = (
 def _score_one(job: dict, profile: dict, *,
                timeout: int = 25) -> tuple:
     """Returns (score, reason). Falls back to (None, '<error>') on any
-    Gemma failure — caller is responsible for skipping unscored rows."""
+    model failure — caller is responsible for skipping unscored rows."""
     user_payload = {
         "freelancer": {
             "skills": profile.get("skills") or [],
@@ -254,23 +251,16 @@ def _score_one(job: dict, profile: dict, *,
         },
     }
     try:
-        r = requests.post(
-            f"{OLLAMA_URL}/api/chat",
-            json={
-                "model":   GEMMA_MODEL,
-                "stream":  False,
-                "format":  "json",
-                "options": {"temperature": 0.0, "num_predict": 150,
-                            "num_ctx": 4096},
-                "messages": [
-                    {"role": "system", "content": _SCORE_SYSTEM},
-                    {"role": "user",   "content": json.dumps(user_payload)},
-                ],
-            },
+        # Claude (task 'classify') when a key is set, else local Gemma.
+        # Don't cap Gemma at its old 150 tokens: gemma4:e4b spends that
+        # on its thinking pass and returns empty content, so no job ever
+        # got a score.
+        import lotus_llm
+        body = lotus_llm.chat(
+            [{"role": "user", "content": json.dumps(user_payload)}],
+            system=_SCORE_SYSTEM, task="classify", json_mode=True,
             timeout=timeout,
         )
-        r.raise_for_status()
-        body = (r.json().get("message") or {}).get("content", "").strip()
         parsed = json.loads(body)
         s = float(parsed.get("score", 0.0))
         s = max(0.0, min(1.0, s))
@@ -315,13 +305,12 @@ def list_top(*, limit: int = 10, min_score: float = 0.7) -> list:
     return db.list_jobs(min_score=min_score, limit=limit)
 
 
-# ── proposal drafting (Claude.ai stub for now) ───────────────────────────
+# ── proposal drafting ────────────────────────────────────────────────────
 
-def _draft_via_gemma(job: dict, profile: dict, *,
-                     timeout: int = 60) -> Optional[str]:
-    """Draft via local Gemma — fallback when Claude.ai isn't reachable.
-    Quality is lower but works fully offline. The Claude.ai browser path
-    is the next iteration."""
+def _draft_via_llm(job: dict, profile: dict, *,
+                   timeout: int = 60) -> Optional[str]:
+    """Draft via lotus_llm (task 'draft'): Claude API when a key is set,
+    else local Gemma - lower quality but works fully offline."""
     sys_prompt = (
         "You are writing a personalized Upwork proposal for the "
         "freelancer based on the job below. Voice: confident, specific, "
@@ -339,34 +328,25 @@ def _draft_via_gemma(job: dict, profile: dict, *,
         },
     }
     try:
-        r = requests.post(
-            f"{OLLAMA_URL}/api/chat",
-            json={
-                "model":   GEMMA_MODEL,
-                "stream":  False,
-                "options": {"temperature": 0.3, "num_predict": 600,
-                            "num_ctx": 4096},
-                "messages": [
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user",   "content": json.dumps(user_payload)},
-                ],
-            },
+        import lotus_llm
+        body = lotus_llm.chat(
+            [{"role": "user", "content": json.dumps(user_payload)}],
+            system=sys_prompt, task="draft", ollama_max_tokens=600,
             timeout=timeout,
         )
-        r.raise_for_status()
-        body = (r.json().get("message") or {}).get("content", "").strip()
         return body if body else None
     except Exception as e:
-        print(f"[upwork] gemma draft error: {e}", flush=True)
+        print(f"[upwork] draft error: {e}", flush=True)
         return None
 
 
 def draft_proposal(job_id: str, *, verbose: bool = _VERBOSE) -> Optional[str]:
-    """V1: drafts via local Gemma. V2 will route to Claude.ai browser."""
+    """Draft a proposal (Claude API, or local Gemma without a key) and
+    store it on the job row for the user to review before sending."""
     job = db.get_job(job_id)
     if not job:
         return None
-    text = _draft_via_gemma(job, db.get_profile())
+    text = _draft_via_llm(job, db.get_profile())
     if text:
         db.set_job_proposal(job_id, text)
     if verbose:
